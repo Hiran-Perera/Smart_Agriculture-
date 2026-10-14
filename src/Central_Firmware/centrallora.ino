@@ -9,6 +9,7 @@
 #include "ui_logic.h"
 #include "ui_screens.h"
 #include "automation.h"
+#include "sensor_store.h"
 
 static const int TFT_CS  = 5;   // D5
 static const int TFT_DC  = 2;   // D2
@@ -28,6 +29,7 @@ EncoderInput g_enc;
 LoRaManager g_lora;
 UiState g_ui;
 AutoPumpAutomation g_auto;
+SensorStore g_sens;
 
 void setup()
 {
@@ -42,6 +44,7 @@ void setup()
 
   g_data.reset();
   g_auto.begin(g_data);
+  g_sens.begin(g_data);
 
   EncoderConfig ec;
   ec.pinA = ENC_A_PIN;
@@ -110,6 +113,11 @@ if (act.sendCfgA) {
 if (act.sendCfgB) {
   g_lora.sendCfgB(act.cfgB_period_s, act.cfgB_rxwin_ms);
 }
+
+    if (act.sendSens) {
+      g_sens.save(g_data, act.sensNode);
+      g_lora.sendSensorCfg(g_data, act.sensNode, g_data.sensCfg[act.sensNode]);
+    }
 
     if (act.autoSave)
     {

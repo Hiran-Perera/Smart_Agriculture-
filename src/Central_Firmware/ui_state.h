@@ -8,6 +8,7 @@ enum class UiPage : uint8_t {
   Relay,
   Settings1,
   Settings2,
+  Sensors,
   COUNT
 };
 
@@ -22,7 +23,7 @@ struct UiTransition {
 struct UiState {
   UiPage page = UiPage::Home;
 
-  int8_t homeIndex = 0;      // 0..3: NodeA, NodeB, Pump, Settings
+  int8_t homeIndex = 0;      // 0..4: NodeA, NodeB, Pump, Sensors, Settings
   int8_t relayIndex = 0;     // 0..5
   bool relayEdit = false;
 
@@ -31,6 +32,11 @@ struct UiState {
 
   int8_t settingsIndex2 = 0; // 0..2
   bool settingsEdit2 = false;
+
+  // sensors page
+  uint8_t sensNode = 0;      // 0 = Node A, 1 = Node B
+  int8_t sensIndex = 0;      // 0 node, 1..3 built-in, 4..6 EXT1..3, 7 SEND
+  uint8_t sensStage = 0;     // 0 browse, 1 editing type, 2 editing pin
 
   // screensaver
   uint32_t lastInputMs = 0;
@@ -53,6 +59,10 @@ struct UiState {
 
     settingsIndex2 = 0;
     settingsEdit2 = false;
+
+    sensNode = 0;
+    sensIndex = 0;
+    sensStage = 0;
 
     lastInputMs = millis();
     saverActive = false;

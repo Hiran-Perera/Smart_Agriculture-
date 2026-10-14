@@ -52,6 +52,27 @@ public:
 
     if (rx.h.dst != Payload::GW_ID) return false;
 
+    // ---------- EXTRA SENSORS (sent just before the node's TELEMETRY, no RXACK) ----------
+    if (rx.h.type == Payload::TELEMETRY_X && rx.h.len == sizeof(Payload::TelemetryX)) {
+      Payload::TelemetryX tx;
+      memcpy(&tx, rx.plain, sizeof(tx));
+      if (tx.ver == 1) {
+        ExtVal* dst = nullptr;
+        if (rx.h.src == Payload::NODE_A) { dst = data.a.ext; data.a.extMs = now; }
+        if (rx.h.src == Payload::NODE_B) { dst = data.b.ext; data.b.extMs = now; }
+        if (dst) {
+          for (uint8_t i = 0; i < Payload::EXT_SLOTS; i++) {
+            dst[i].type  = tx.s[i].type;
+            dst[i].pin   = tx.s[i].pin;
+            dst[i].value = tx.s[i].value;
+            dst[i].valid = (tx.s[i].type != Payload::SENS_NONE);
+          }
+          changed = true;
+        }
+      }
+      return changed;
+    }
+
     // ---------- TELEMETRY ----------
     if (rx.h.type == Payload::TELEMETRY) {
       // ACK telemetry fast
@@ -72,14 +93,17 @@ public:
             data.a.radio.snr  = rx.snr;
             data.a.rssi = rx.rssi;
             data.a.snr  = rx.snr;
+            // Extra sensors arrive right before telemetry; if none did, they are switched off.
+            if ((uint32_t)(now - data.a.extMs) > 3000) clear_ext_(data.a.ext);
             changed = true;
           }
         }
 
         // IMPORTANT: wait a bit after RXACK so node enters rx window
-        if (_pend_cfgA) {
+        if (_pend_cfgA || _pend_sensA) {
           delay(80);
-          if (try_send_cfgA_()) changed = true;
+          if (_pend_cfgA && try_send_cfgA_()) changed = true;
+          if (_pend_sensA && try_send_sens_(data, 0)) changed = true;
         }
       }
 
@@ -98,21 +122,41 @@ public:
             data.b.radio.snr    = rx.snr;
             data.b.rssi = rx.rssi;
             data.b.snr  = rx.snr;
+            if ((uint32_t)(now - data.b.extMs) > 3000) clear_ext_(data.b.ext);
             changed = true;
           }
         }
 
         // IMPORTANT: wait a bit after RXACK so node enters rx window
-        if (_pend_relay || _pend_cfgB) {
+        if (_pend_relay || _pend_cfgB || _pend_sensB) {
           delay(80);
           if (_pend_relay) { if (try_send_relay_()) changed = true; }
           if (_pend_cfgB)  { if (try_send_cfgB_()) changed = true; }
+          if (_pend_sensB) { if (try_send_sens_(data, 1)) changed = true; }
         }
       }
     }
 
     // ---------- ACK_CMD ----------
     if (rx.h.type == Payload::ACK_CMD) {
+      if ((rx.h.src == Payload::NODE_A || rx.h.src == Payload::NODE_B) &&
+          rx.h.len == sizeof(Payload::AckSensorCfg)) {
+        const uint8_t n = (rx.h.src == Payload::NODE_B) ? 1 : 0;
+        Payload::AckSensorCfg a;
+        memcpy(&a, rx.plain, sizeof(a));
+        if (n ? _pend_sensB : _pend_sensA) {
+          if (rx.h.msgId == (n ? _pend_sensB_id : _pend_sensA_id)) {
+            (n ? _pend_sensB : _pend_sensA) = false;
+            data.sensAck[n].pending = false;
+            data.sensAck[n].ok = (a.ok != 0);
+            data.sensAck[n].lastAckMs = now;
+            Serial.print("GW SENSOR_CFG "); Serial.print(n ? "B " : "A ");
+            Serial.println(a.ok ? "success" : "rejected");
+            changed = true;
+          }
+        }
+      }
+
       if (rx.h.src == Payload::NODE_A && rx.h.len == sizeof(Payload::AckCfgSleepA)) {
         Payload::AckCfgSleepA a;
         memcpy(&a, rx.plain, sizeof(a));
@@ -177,6 +221,25 @@ public:
     Serial.println("GW CFG_A pending");
   }
 
+  // n: 0 = Node A, 1 = Node B. Delivered on the node's next wake-up (like the other commands).
+  void sendSensorCfg(DataModel& data, uint8_t n, const Payload::CmdSensorCfg& cfg) {
+    data.sensAck[n].pending = true;
+    data.sensAck[n].ok = false;
+    data.sensAck[n].lastSendMs = millis();
+    if (n == 0) {
+      _pend_sensA_data = cfg;
+      _pend_sensA = true;
+      _pend_sensA_id = _msgId++;
+      _pend_sensA_tries = 0;
+    } else {
+      _pend_sensB_data = cfg;
+      _pend_sensB = true;
+      _pend_sensB_id = _msgId++;
+      _pend_sensB_tries = 0;
+    }
+    Serial.print("GW SENSOR_CFG pending node="); Serial.println(n ? "B" : "A");
+  }
+
   void sendCfgB(uint16_t period_s, uint16_t rxwin_ms) {
     _pend_cfgB_data.period_s = period_s;
     _pend_cfgB_data.rxwin_ms = rxwin_ms;
@@ -202,6 +265,41 @@ private:
   Payload::CmdCfgSleepB _pend_cfgB_data = {};
   uint32_t _pend_cfgB_id = 0;
   uint8_t  _pend_cfgB_tries = 0;
+
+  bool _pend_sensA = false;
+  Payload::CmdSensorCfg _pend_sensA_data = {};
+  uint32_t _pend_sensA_id = 0;
+  uint8_t  _pend_sensA_tries = 0;
+
+  bool _pend_sensB = false;
+  Payload::CmdSensorCfg _pend_sensB_data = {};
+  uint32_t _pend_sensB_id = 0;
+  uint8_t  _pend_sensB_tries = 0;
+
+  static void clear_ext_(ExtVal* e) {
+    for (uint8_t i = 0; i < Payload::EXT_SLOTS; i++) e[i].valid = false;
+  }
+
+  bool try_send_sens_(DataModel& data, uint8_t n) {
+    bool& pend = n ? _pend_sensB : _pend_sensA;
+    uint8_t& tries = n ? _pend_sensB_tries : _pend_sensA_tries;
+    if (!pend) return false;
+    if (tries >= 3) {
+      Serial.println("GW SENSOR_CFG failed");
+      pend = false;
+      data.sensAck[n].pending = false;
+      data.sensAck[n].ok = false;
+      return true;
+    }
+    const uint8_t dst = n ? Payload::NODE_B : Payload::NODE_A;
+    const uint32_t id = n ? _pend_sensB_id : _pend_sensA_id;
+    Payload::CmdSensorCfg& d = n ? _pend_sensB_data : _pend_sensA_data;
+    bool ok = Link::send_enc(Payload::GW_ID, dst, Payload::CMD_SENSOR_CFG, 2, id,
+                             (uint8_t*)&d, sizeof(d), true);
+    Link::log_tx("GW", "CMD_SENSOR_CFG", ok, Payload::GW_ID, dst, Payload::CMD_SENSOR_CFG, 2, id);
+    tries++;
+    return true;
+  }
 
   bool _pend_relay = false;
   Payload::CmdRelay _pend_relay_data = {};

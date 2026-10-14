@@ -16,7 +16,10 @@ enum MsgType : uint8_t {
   RXACK     = 0x04,   // GW -> Node (telemetry received)
 
   CMD_CFG_A = 0x10,   // GW -> NodeA sleep config
-  CMD_CFG_B = 0x11    // GW -> NodeB sleep config
+  CMD_CFG_B = 0x11,   // GW -> NodeB sleep config
+  CMD_SENSOR_CFG = 0x12, // GW -> Node sensor/pin assignment (ack = AckSensorCfg)
+
+  TELEMETRY_X = 0x05  // Node -> GW extra (user assigned) sensors, no RXACK
 };
 
 #pragma pack(push, 1)
@@ -76,6 +79,54 @@ struct CmdRelay {
 #pragma pack(push, 1)
 struct AckRelay {
   uint8_t applied_state; // 0/1
+};
+#pragma pack(pop)
+
+// ---- Sensor assignment ----
+static const uint8_t EXT_SLOTS = 3;     // user assignable sensor slots per node
+static const uint8_t PIN_NONE  = 0xFF;
+
+enum SensorType : uint8_t {
+  SENS_NONE    = 0,
+  SENS_ANALOG  = 1,  // raw 12-bit ADC (ADC capable pins only)
+  SENS_DIGITAL = 2,  // 0/1 (internal pull-up enabled)
+  SENS_PULSE   = 3   // pulse counter, reported as Hz x10
+};
+
+#pragma pack(push, 1)
+struct SensorSlotCfg {
+  uint8_t type;   // SensorType
+  uint8_t pin;    // GPIO, PIN_NONE if type == SENS_NONE
+};
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+struct CmdSensorCfg {
+  uint8_t ver;                       // 1
+  uint8_t flow_pin;                  // NodeB flow sensor GPIO, PIN_NONE on NodeA
+  SensorSlotCfg slot[EXT_SLOTS];
+};
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+struct AckSensorCfg {
+  uint8_t ver;   // 1
+  uint8_t ok;    // 1 applied, 0 rejected
+};
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+struct ExtSlotVal {
+  uint8_t  type;
+  uint8_t  pin;
+  uint16_t value;   // ANALOG raw, DIGITAL 0/1, PULSE Hz x10
+};
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+struct TelemetryX {
+  uint8_t ver;      // 1
+  ExtSlotVal s[EXT_SLOTS];
 };
 #pragma pack(pop)
 

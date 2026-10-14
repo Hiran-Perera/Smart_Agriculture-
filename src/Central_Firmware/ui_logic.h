@@ -20,6 +20,9 @@ struct UiActions {
   uint16_t cfgB_rxwin_ms = 400;
 
   bool autoSave = false;
+
+  bool sendSens = false;
+  uint8_t sensNode = 0;
 };
 
 static inline uint16_t clamp_u16(int32_t v, uint16_t lo, uint16_t hi) {
@@ -29,6 +32,7 @@ static inline uint16_t clamp_u16(int32_t v, uint16_t lo, uint16_t hi) {
 }
 
 static inline void ui_go_home(UiState& ui, UiActions& act) {
+  ui.sensStage = 0;
   act.requestPageChange = true;
   act.nextPage = UiPage::Home;
 }
@@ -43,14 +47,15 @@ static inline void ui_handle_input(UiState& ui, DataModel& data, const EncoderEv
 
   switch (ui.page) {
     case UiPage::Home: {
-      if (d) ui.homeIndex = (int8_t)clamp_u16(ui.homeIndex + d, 0, 3);
+      if (d) ui.homeIndex = (int8_t)clamp_u16(ui.homeIndex + d, 0, 4);
 
       if (ev.shortPress) {
         UiPage to = UiPage::Home;
         if (ui.homeIndex == 0) to = UiPage::NodeA_Details;
         if (ui.homeIndex == 1) to = UiPage::NodeB_Details;
         if (ui.homeIndex == 2) to = UiPage::Relay;
-        if (ui.homeIndex == 3) to = UiPage::Settings1;
+        if (ui.homeIndex == 3) to = UiPage::Sensors;
+        if (ui.homeIndex == 4) to = UiPage::Settings1;
         act.requestPageChange = true;
         act.nextPage = to;
       }
@@ -180,6 +185,45 @@ static inline void ui_handle_input(UiState& ui, DataModel& data, const EncoderEv
           if (ui.settingsIndex2 == 1) data.cfg.cfgB_rxwin_ms = clamp_u16((int32_t)data.cfg.cfgB_rxwin_ms + d * 10, 50, 5000);
         }
         if (ev.shortPress) ui.settingsEdit2 = false;
+      }
+    } break;
+
+    case UiPage::Sensors: {
+      // 0 NODE  1..3 built-in sensors  4..6 EXT1..3  7 SEND
+      const uint8_t nodeId = ui.sensNode ? Payload::NODE_B : Payload::NODE_A;
+      Payload::CmdSensorCfg& cfg = data.sensCfg[ui.sensNode];
+      const int8_t SENS_ROWS = 8;
+
+      if (ui.sensStage == 0) {
+        if (d < 0 && ui.sensIndex == 0) { ui_go_home(ui, act); break; }
+        if (d) ui.sensIndex = (int8_t)clamp_u16(ui.sensIndex + d, 0, SENS_ROWS - 1);
+
+        if (ev.shortPress) {
+          if (ui.sensIndex == 0) {
+            ui.sensNode ^= 1;
+          } else if (ui.sensIndex == 1 && ui.sensNode == 1) {
+            ui.sensStage = 2;                       // Node B flow pin
+          } else if (ui.sensIndex >= 4 && ui.sensIndex <= 6) {
+            ui.sensStage = 1;                       // EXT slot: type first, then pin
+          } else if (ui.sensIndex == SENS_ROWS - 1) {
+            act.sendSens = true;
+            act.sensNode = ui.sensNode;
+          }
+          // other rows are fixed wiring, nothing to edit
+        }
+      } else {
+        const bool isFlow = (ui.sensNode == 1 && ui.sensIndex == 1);
+        const uint8_t slot = isFlow ? SensorMap::FLOW_SLOT : (uint8_t)(ui.sensIndex - 4);
+
+        if (d) {
+          int8_t dir = (d > 0) ? 1 : -1;
+          if (ui.sensStage == 1) SensorMap::cycle_type(nodeId, cfg, slot, dir);
+          else                   SensorMap::cycle_pin(nodeId, cfg, slot, dir);
+        }
+        if (ev.shortPress) {
+          if (ui.sensStage == 1 && cfg.slot[slot].type != Payload::SENS_NONE) ui.sensStage = 2;
+          else ui.sensStage = 0;
+        }
       }
     } break;
 

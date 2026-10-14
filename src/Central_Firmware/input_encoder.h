@@ -1,6 +1,12 @@
 #pragma once
 #include <Arduino.h>
 
+// Interrupt-driven rotary encoder + push button.
+//
+// The A/B lines and the switch are decoded inside GPIO interrupts, so rotation
+// and presses are captured even while the main loop is busy (TFT redraws,
+// LoRa delays, Bluetooth). poll() only drains what the ISRs already counted.
+
 struct EncoderConfig {
   int pinA = -1;
   int pinB = -1;
@@ -8,7 +14,7 @@ struct EncoderConfig {
 
   bool pullups = true;
 
-  uint16_t debounceMs = 25;
+  uint16_t debounceMs = 20;
   uint16_t longPressMs = 800;
 
   // Typical mechanical encoder gives 4 transitions per detent.
@@ -21,34 +27,112 @@ struct EncoderEvents {
   bool longPress = false;
 };
 
+namespace EncIsr {
+
+static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+static int pinA = -1, pinB = -1, pinSw = -1;
+static uint8_t  stepsPerDetent = 4;
+static uint32_t debounceUs = 20000;
+static uint32_t longPressMs = 800;
+
+// Valid Gray-code transitions only; anything else counts as 0.
+static const DRAM_ATTR int8_t qdec[16] = {
+   0, -1, +1,  0,
+  +1,  0,  0, -1,
+  -1,  0,  0, +1,
+   0, +1, -1,  0
+};
+
+static volatile uint8_t  prevAB = 0;
+static volatile int16_t  accum = 0;     // raw edges, -N..+N within a detent
+static volatile int16_t  detents = 0;   // completed detents not yet consumed
+
+static volatile uint8_t  btnLevel = HIGH;
+static volatile uint32_t btnLastEdgeUs = 0;
+static volatile uint32_t pressStartMs = 0;
+static volatile bool     pressing = false;
+static volatile bool     longFired = false;
+static volatile uint8_t  shortCount = 0;
+static volatile uint8_t  longCount = 0;
+
+static void IRAM_ATTR isrAB() {
+  uint8_t cur = (uint8_t)((digitalRead(pinA) << 1) | digitalRead(pinB));
+
+  portENTER_CRITICAL_ISR(&mux);
+  int8_t step = qdec[(prevAB << 2) | cur];
+  prevAB = cur;
+
+  if (step != 0) {
+    accum += step;
+    if (accum >= (int16_t)stepsPerDetent)       { accum -= stepsPerDetent; detents++; }
+    else if (accum <= -(int16_t)stepsPerDetent) { accum += stepsPerDetent; detents--; }
+  }
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+static void IRAM_ATTR isrSw() {
+  uint32_t nowUs = micros();
+  uint8_t level = (uint8_t)digitalRead(pinSw);
+
+  portENTER_CRITICAL_ISR(&mux);
+  if ((uint32_t)(nowUs - btnLastEdgeUs) >= debounceUs && level != btnLevel) {
+    btnLastEdgeUs = nowUs;
+    btnLevel = level;
+    uint32_t nowMs = nowUs / 1000;
+
+    if (level == LOW) {
+      pressing = true;
+      longFired = false;
+      pressStartMs = nowMs;
+    } else {
+      if (pressing && !longFired && (uint32_t)(nowMs - pressStartMs) < longPressMs) {
+        if (shortCount < 255) shortCount++;
+      }
+      pressing = false;
+    }
+  }
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+} // namespace EncIsr
+
 class EncoderInput {
 public:
   void begin(const EncoderConfig& cfg) {
     _cfg = cfg;
 
-    if (_cfg.pullups) {
-      pinMode(_cfg.pinA, INPUT_PULLUP);
-      pinMode(_cfg.pinB, INPUT_PULLUP);
-      pinMode(_cfg.pinSw, INPUT_PULLUP);
-    } else {
-      pinMode(_cfg.pinA, INPUT);
-      pinMode(_cfg.pinB, INPUT);
-      pinMode(_cfg.pinSw, INPUT);
-    }
+    const uint8_t mode = _cfg.pullups ? INPUT_PULLUP : INPUT;
+    pinMode(_cfg.pinA, mode);
+    pinMode(_cfg.pinB, mode);
+    pinMode(_cfg.pinSw, mode);
 
-    uint8_t a = (uint8_t)digitalRead(_cfg.pinA);
-    uint8_t b = (uint8_t)digitalRead(_cfg.pinB);
-    _prevAB = (a << 1) | b;
+    EncIsr::pinA = _cfg.pinA;
+    EncIsr::pinB = _cfg.pinB;
+    EncIsr::pinSw = _cfg.pinSw;
+    EncIsr::stepsPerDetent = _cfg.stepsPerDetent ? _cfg.stepsPerDetent : 4;
+    EncIsr::debounceUs = (uint32_t)_cfg.debounceMs * 1000UL;
+    EncIsr::longPressMs = _cfg.longPressMs;
 
-    _accumSteps = 0;
+    EncIsr::prevAB = (uint8_t)((digitalRead(_cfg.pinA) << 1) | digitalRead(_cfg.pinB));
+    EncIsr::accum = 0;
+    EncIsr::detents = 0;
+    EncIsr::btnLevel = (uint8_t)digitalRead(_cfg.pinSw);
+    EncIsr::btnLastEdgeUs = micros();
+    EncIsr::pressing = false;
+    EncIsr::longFired = false;
+    EncIsr::shortCount = 0;
+    EncIsr::longCount = 0;
 
-    _btnStable = digitalRead(_cfg.pinSw);
-    _btnLastRead = _btnStable;
-    _btnLastChangeMs = millis();
+    attachInterrupt(digitalPinToInterrupt(_cfg.pinA), EncIsr::isrAB, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(_cfg.pinB), EncIsr::isrAB, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(_cfg.pinSw), EncIsr::isrSw, CHANGE);
+  }
 
-    _pressing = false;
-    _pressStartMs = 0;
-    _longFired = false;
+  // True when there is something waiting for poll() (cheap, no locking).
+  bool pending() const {
+    return EncIsr::detents != 0 || EncIsr::shortCount != 0 || EncIsr::longCount != 0 ||
+           (EncIsr::pressing && !EncIsr::longFired);
   }
 
   void poll(EncoderEvents& ev) {
@@ -56,86 +140,31 @@ public:
     ev.shortPress = false;
     ev.longPress = false;
 
-    // ----- Quadrature decode (polling) -----
-    // Table from prevAB<<2 | curAB : -1, 0, +1
-    // Valid transitions only. Invalid transitions treated as 0.
-    static const int8_t qdec[16] = {
-      0, -1, +1,  0,
-      +1, 0,  0, -1,
-      -1, 0,  0, +1,
-      0, +1, -1, 0
-    };
+    uint32_t nowMs = millis();
 
-    uint8_t a = (uint8_t)digitalRead(_cfg.pinA);
-    uint8_t b = (uint8_t)digitalRead(_cfg.pinB);
-    uint8_t curAB = (a << 1) | b;
+    portENTER_CRITICAL(&EncIsr::mux);
 
-    uint8_t idx = (uint8_t)((_prevAB << 2) | curAB);
-    int8_t step = qdec[idx];
-    _prevAB = curAB;
-
-    if (step != 0) {
-      _accumSteps += step;
-
-      int8_t det = 0;
-      const int8_t spd = (int8_t)_cfg.stepsPerDetent;
-
-      while (_accumSteps >= spd) { _accumSteps -= spd; det++; }
-      while (_accumSteps <= -spd) { _accumSteps += spd; det--; }
-
-      if (det != 0) ev.delta = det;
+    // A held button turns into a long press as soon as the threshold passes.
+    if (EncIsr::pressing && !EncIsr::longFired &&
+        (uint32_t)(nowMs - EncIsr::pressStartMs) >= EncIsr::longPressMs) {
+      EncIsr::longFired = true;
+      if (EncIsr::longCount < 255) EncIsr::longCount++;
     }
 
-    // ----- Button debounce + short/long press -----
-    uint32_t now = millis();
-    int btn = digitalRead(_cfg.pinSw);
+    int16_t d = EncIsr::detents;
+    EncIsr::detents = 0;
+    if (d > 127) d = 127;
+    if (d < -127) d = -127;
+    ev.delta = (int8_t)d;
 
-    if (btn != _btnLastRead) {
-      _btnLastRead = btn;
-      _btnLastChangeMs = now;
-    }
+    ev.shortPress = EncIsr::shortCount > 0;
+    ev.longPress  = EncIsr::longCount > 0;
+    EncIsr::shortCount = 0;
+    EncIsr::longCount = 0;
 
-    if ((uint32_t)(now - _btnLastChangeMs) >= _cfg.debounceMs) {
-      if (btn != _btnStable) {
-        _btnStable = btn;
-
-        // Active low
-        if (_btnStable == LOW) {
-          _pressing = true;
-          _pressStartMs = now;
-          _longFired = false;
-        } else {
-          // released
-          if (_pressing) {
-            uint32_t held = now - _pressStartMs;
-            if (!_longFired && held < _cfg.longPressMs) {
-              ev.shortPress = true;
-            }
-          }
-          _pressing = false;
-        }
-      }
-    }
-
-    if (_pressing && !_longFired) {
-      if ((uint32_t)(now - _pressStartMs) >= _cfg.longPressMs) {
-        _longFired = true;
-        ev.longPress = true;
-      }
-    }
+    portEXIT_CRITICAL(&EncIsr::mux);
   }
 
 private:
   EncoderConfig _cfg;
-
-  uint8_t _prevAB = 0;
-  int16_t _accumSteps = 0;
-
-  int _btnStable = HIGH;
-  int _btnLastRead = HIGH;
-  uint32_t _btnLastChangeMs = 0;
-
-  bool _pressing = false;
-  uint32_t _pressStartMs = 0;
-  bool _longFired = false;
 };

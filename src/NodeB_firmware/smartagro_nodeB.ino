@@ -12,6 +12,7 @@
 #include "mesh_forward.h"
 #include "power_policy.h"
 #include "sensors_b.h"
+#include "ext_sensors.h"
 
 #include "driver/gpio.h"
 
@@ -32,7 +33,7 @@ static const int LORA_DIO0 = 20;
 // I/O pins (your wiring)
 static const int PIN_SOIL  = 1;   // ADC
 static const int PIN_BATT  = 0;   // ADC
-static const int PIN_FLOW  = 3;   // interrupt input
+// Flow sensor pin is user selectable (default GPIO3), see ExtSensors::flow_pin()
 static const int PIN_RELAY = 2;   // motor gate/driver pin (inverted stage)
 
 static const float BATT_DIVIDER_RATIO = 2.0f;
@@ -41,7 +42,6 @@ static const float BATT_DIVIDER_RATIO = 2.0f;
 static const uint16_t DEF_PERIOD_S = 30;
 static const uint16_t DEF_RXWIN_MS = 2500;
 
-static volatile uint32_t g_flowPulses = 0;
 static uint32_t g_msgId = 1;
 
 // Motor steady state
@@ -61,8 +61,6 @@ static const uint16_t SOFTSTEP_MS  = 30;    // update every 30ms
 static bool     g_rampActive = false;
 static uint32_t g_rampStartMs = 0;
 static uint32_t g_rampLastStepMs = 0;
-
-static void IRAM_ATTR isr_flow() { g_flowPulses++; }
 
 // Inverted stage: ON->LOW, OFF->HIGH
 static inline int motor_level_for(bool onLogical) { return onLogical ? 0 : 1; }
@@ -180,6 +178,26 @@ static void handle_cfg_pkt(const Link::RxPacket &rx) {
   Link::log_tx(DEV, "ACK_CFG_B", ok, SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId);
 }
 
+static void handle_sensor_pkt(const Link::RxPacket &rx) {
+  if (rx.h.type != CMD_SENSOR_CFG) return;
+  if (rx.h.src != GW_ID) return;
+  if (rx.h.len != sizeof(CmdSensorCfg)) return;
+
+  CmdSensorCfg c;
+  memcpy(&c, rx.plain, sizeof(c));
+
+  AckSensorCfg a;
+  a.ver = 1;
+  a.ok = ExtSensors::set_config(c) ? 1 : 0;
+
+  bool ok = Link::send_enc(SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId, (uint8_t*)&a, sizeof(a), true);
+  Link::log_tx(DEV, "ACK_SENSOR", ok, SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId);
+
+  Serial.print(DEV);
+  Serial.print(" SENSOR cfg ");
+  Serial.println(a.ok ? "applied" : "rejected");
+}
+
 static void handle_motor_pkt(const Link::RxPacket &rx) {
   if (rx.h.type != CMD_RELAY) return;
   if (rx.h.src != GW_ID) return;
@@ -215,6 +233,7 @@ static bool wait_rxack(uint32_t id, uint32_t timeoutMs) {
 
       if (rx.h.type == CMD_RELAY) { handle_motor_pkt(rx); continue; }
       if (rx.h.type == CMD_CFG_B) { handle_cfg_pkt(rx); continue; }
+      if (rx.h.type == CMD_SENSOR_CFG) { handle_sensor_pkt(rx); continue; }
 
       if (rx.h.type == RXACK && rx.h.msgId == id) {
         Serial.print(DEV); Serial.print(" RXACK ok id="); Serial.println(id);
@@ -247,6 +266,7 @@ static void rx_window(uint16_t rxwinMs) {
 
     if (rx.h.type == CMD_RELAY) { handle_motor_pkt(rx); continue; }
     if (rx.h.type == CMD_CFG_B) { handle_cfg_pkt(rx); continue; }
+    if (rx.h.type == CMD_SENSOR_CFG) { handle_sensor_pkt(rx); continue; }
   }
 }
 
@@ -257,6 +277,7 @@ void setup() {
 
   analogReadResolution(12);
   PowerPolicy::begin("nodeB");
+  ExtSensors::begin(SELF_ID);
 
   pinMode(PIN_RELAY, OUTPUT);
   gpio_hold_dis((gpio_num_t)PIN_RELAY);
@@ -264,9 +285,6 @@ void setup() {
   g_motorOn = false;
   g_targetOn = false;
   g_rampActive = false;
-
-  pinMode(PIN_FLOW, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_FLOW), isr_flow, RISING);
 
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
@@ -289,15 +307,19 @@ void loop() {
   uint16_t rxwin_ms = PowerPolicy::get_rxwin_ms(DEF_RXWIN_MS);
   if (period_s < 5) period_s = 5;
 
-  uint32_t p0 = g_flowPulses;
+  // One 200 ms window measures the flow sensor and any pulse sensors together.
+  ExtSensors::window_begin();
   delay(200);
-  uint32_t p1 = g_flowPulses;
-  uint32_t dp = p1 - p0;
+  const uint32_t WINDOW_MS = 200;
+
+  TelemetryX tx;
+  const bool haveExt = ExtSensors::any_active();
+  if (haveExt) ExtSensors::sample(tx, WINDOW_MS);
 
   TelemetryB tb;
   tb.ver = 1;
   tb.soil_raw = SensorsB::read_adc_u16(PIN_SOIL);
-  tb.flow_hz_x10 = (uint16_t)(dp * 5 * 10);
+  tb.flow_hz_x10 = ExtSensors::hz_x10(ExtSensors::FLOW_IDX, WINDOW_MS);
   tb.batt_mV = SensorsB::read_batt_mV(PIN_BATT, BATT_DIVIDER_RATIO);
   tb.relay_state = g_targetOn ? 1 : 0;
 
@@ -305,6 +327,13 @@ void loop() {
   Serial.print(" flowx10="); Serial.print(tb.flow_hz_x10);
   Serial.print(" battmV="); Serial.print(tb.batt_mV);
   Serial.print(" motor="); Serial.println(tb.relay_state);
+
+  // Extra sensors go first and blocking, so they never overlap the gateway's replies.
+  if (haveExt) {
+    uint32_t xid = g_msgId++;
+    bool xs = Link::send_enc(SELF_ID, GW_ID, TELEMETRY_X, 2, xid, (uint8_t*)&tx, sizeof(tx), false);
+    Link::log_tx(DEV, "TEL_X", xs, SELF_ID, GW_ID, TELEMETRY_X, 2, xid);
+  }
 
   uint32_t id = g_msgId++;
   bool sent = Link::send_enc(SELF_ID, GW_ID, TELEMETRY, 2, id, (uint8_t*)&tb, sizeof(tb), true);

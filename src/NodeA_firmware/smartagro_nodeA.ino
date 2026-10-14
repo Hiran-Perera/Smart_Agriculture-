@@ -10,6 +10,7 @@
 #include "mesh_forward.h"
 #include "power_policy.h"
 #include "sensors_a.h"
+#include "ext_sensors.h"
 
 static const char *DEV = "NA";
 using namespace Payload;
@@ -70,6 +71,24 @@ static bool wait_rxack(uint32_t id, uint32_t timeoutMs) {
   return false;
 }
 
+static void handle_sensor_cfg(const Link::RxPacket &rx) {
+  if (rx.h.len != sizeof(CmdSensorCfg)) return;
+
+  CmdSensorCfg c;
+  memcpy(&c, rx.plain, sizeof(c));
+
+  AckSensorCfg a;
+  a.ver = 1;
+  a.ok = ExtSensors::set_config(c) ? 1 : 0;
+
+  bool ok = Link::send_enc(SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId, (uint8_t*)&a, sizeof(a), true);
+  Link::log_tx(DEV, "ACK_SENSOR", ok, SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId);
+
+  Serial.print(DEV);
+  Serial.print(" SENSOR cfg ");
+  Serial.println(a.ok ? "applied" : "rejected");
+}
+
 static void handle_cfg_window(uint16_t rxwinMs) {
   uint32_t t0 = millis();
   while (millis() - t0 < rxwinMs) {
@@ -84,6 +103,11 @@ static void handle_cfg_window(uint16_t rxwinMs) {
     }
 
     if (rx.h.dst != SELF_ID) continue;
+
+    if (rx.h.type == CMD_SENSOR_CFG && rx.h.src == GW_ID) {
+      handle_sensor_cfg(rx);
+      continue;
+    }
 
     if (rx.h.type == CMD_CFG_A && rx.h.src == GW_ID && rx.h.len == sizeof(CmdCfgSleepA)) {
       CmdCfgSleepA c;
@@ -120,6 +144,7 @@ void setup() {
 
   analogReadResolution(12);
   PowerPolicy::begin("nodeA");
+  ExtSensors::begin(SELF_ID);
 
   dht.begin();
 
@@ -158,6 +183,17 @@ void loop() {
     ta.hum_x100 = (int16_t)lroundf(h * 100.0f);
   }
 
+  // User assigned sensors: measure pulses over a short window if any are configured.
+  TelemetryX tx;
+  const bool haveExt = ExtSensors::any_active();
+  if (ExtSensors::has_pulse_slot()) {
+    ExtSensors::window_begin();
+    delay(200);
+    ExtSensors::sample(tx, 200);
+  } else if (haveExt) {
+    ExtSensors::sample(tx, 0);
+  }
+
   ta.light_raw  = SensorsA::read_adc_u16(PIN_LDR);
   ta.batt_mV    = SensorsA::read_batt_mV(PIN_BATT, BATT_DIVIDER_RATIO);
 
@@ -174,6 +210,13 @@ void loop() {
   Serial.print(ta.light_raw);
   Serial.print(" battmV=");
   Serial.println(ta.batt_mV);
+
+  // Extra sensors go first and blocking, so they never overlap the gateway's replies.
+  if (haveExt) {
+    uint32_t xid = g_msgId++;
+    bool xs = Link::send_enc(SELF_ID, GW_ID, TELEMETRY_X, 2, xid, (uint8_t*)&tx, sizeof(tx), false);
+    Link::log_tx(DEV, "TEL_X", xs, SELF_ID, GW_ID, TELEMETRY_X, 2, xid);
+  }
 
   uint32_t id = g_msgId++;
   bool sent = Link::send_enc(SELF_ID, GW_ID, TELEMETRY, 2, id, (uint8_t*)&ta, sizeof(ta), true);

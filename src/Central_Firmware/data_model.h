@@ -1,9 +1,19 @@
 #pragma once
 #include <Arduino.h>
+#include "payloads.h"
+#include "sensor_map.h"
 
 static inline const char* yesno(bool v){ return v ? "ON":"OFF"; }
 
 struct NodeRadio { int16_t rssi=0; float snr=0; };
+
+// Latest value of a user assigned (EXT) sensor as reported by the node.
+struct ExtVal {
+  uint8_t  type = 0;     // Payload::SensorType
+  uint8_t  pin = 0xFF;
+  uint16_t value = 0;
+  bool     valid = false;
+};
 
 struct NodeAState {
   uint16_t light_raw=0;
@@ -19,6 +29,9 @@ struct NodeAState {
 
   int rssi = 0;
   float snr = 0.0f;
+
+  ExtVal ext[Payload::EXT_SLOTS];
+  uint32_t extMs = 0;
 };
 
 struct NodeBState {
@@ -32,6 +45,9 @@ struct NodeBState {
 
   int rssi = 0;
   float snr = 0.0f;
+
+  ExtVal ext[Payload::EXT_SLOTS];
+  uint32_t extMs = 0;
 };
 
 struct AckState {
@@ -78,6 +94,10 @@ struct DataModel {
 
   ConfigState cfg;
   AutoPumpSettings autoPump;
+
+  // Sensor assignment being edited / last sent, index 0 = Node A, 1 = Node B
+  Payload::CmdSensorCfg sensCfg[2];
+  AckState sensAck[2];
 
   void reset() { *this = DataModel(); }
 };

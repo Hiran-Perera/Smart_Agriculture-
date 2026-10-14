@@ -80,15 +80,30 @@ static inline void draw_home(const UiDrawContext& c, int16_t xoff) {
   const int16_t cardW = 152;
   const int16_t x = xoff + (t.width() - cardW) / 2;
 
-  const char* items[4] = { "NODE A", "NODE B", "PUMP", "SETTINGS" };
+  const char* items[5] = { "NODE A", "NODE B", "PUMP", "SENSORS", "SETTINGS" };
 
-  const int16_t y0 = 28;
-  const int16_t itemH = 18;
-  const int16_t gap = 6;
+  const int16_t y0 = 24;
+  const int16_t itemH = 16;
+  const int16_t gap = 4;
 
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 5; i++) {
     t.drawListItem(x, (int16_t)(y0 + i * (itemH + gap)), cardW, itemH, items[i], (u.homeIndex == i));
   }
+}
+
+// "EXT 2048 1 12.3Hz" - values of the enabled user sensors, false if none.
+static inline bool fmt_ext_line(char* buf, size_t n, const ExtVal* e) {
+  size_t len = (size_t)snprintf(buf, n, "EXT");
+  bool any = false;
+  for (uint8_t i = 0; i < Payload::EXT_SLOTS && len < n; i++) {
+    if (!e[i].valid) continue;
+    any = true;
+    if (e[i].type == Payload::SENS_PULSE)
+      len += (size_t)snprintf(buf + len, n - len, " %u.%uHz", (unsigned)(e[i].value / 10), (unsigned)(e[i].value % 10));
+    else
+      len += (size_t)snprintf(buf + len, n - len, " %u", (unsigned)e[i].value);
+  }
+  return any;
 }
 
 static inline void draw_nodeA(const UiDrawContext& c, int16_t xoff) {
@@ -123,6 +138,8 @@ static inline void draw_nodeA(const UiDrawContext& c, int16_t xoff) {
   if (d.a.hum_x100 == (int16_t)0x8000) snprintf(buf, sizeof(buf), "HUM NA");
   else snprintf(buf, sizeof(buf), "HUM %.2f%%", d.a.hum_x100 / 100.0f);
   draw_center_bg(t, xoff, 82, buf, ST77XX_WHITE);
+
+  if (fmt_ext_line(buf, sizeof(buf), d.a.ext)) draw_center_bg(t, xoff, 93, buf, ST77XX_CYAN);
 
   uint32_t age = (uint32_t)((c.nowMs - d.a.lastSeenMs) / 1000);
   snprintf(buf, sizeof(buf), "LAST %lus", (unsigned long)age);
@@ -159,6 +176,8 @@ static inline void draw_nodeB(const UiDrawContext& c, int16_t xoff) {
 
   snprintf(buf, sizeof(buf), "RELAY %s", d.b.relay_state ? "ON" : "OFF");
   draw_center_bg(t, xoff, 82, buf, d.b.relay_state ? ST77XX_GREEN : ST77XX_RED);
+
+  if (fmt_ext_line(buf, sizeof(buf), d.b.ext)) draw_center_bg(t, xoff, 93, buf, ST77XX_CYAN);
 
   uint32_t age = (uint32_t)((c.nowMs - d.b.lastSeenMs) / 1000);
   snprintf(buf, sizeof(buf), "LAST %lus", (unsigned long)age);
@@ -239,8 +258,78 @@ static inline void draw_settings2(const UiDrawContext& c, int16_t xoff) {
   if (u.settingsEdit2) t.drawTextNoBg(xoff + 126, 10, "EDIT", ST77XX_YELLOW);
 }
 
+static inline void draw_sensors(const UiDrawContext& c, int16_t xoff) {
+  auto& t = *c.tft;
+  const auto& d = *c.data;
+  const auto& u = *c.ui;
+
+  const uint8_t n = u.sensNode;
+  const bool isB = (n == 1);
+  const Payload::CmdSensorCfg& cfg = d.sensCfg[n];
+  const ExtVal* live = isB ? d.b.ext : d.a.ext;
+
+  t.drawHeader(xoff, "SENSORS");
+  if (u.sensStage) t.drawTextNoBg(xoff + 126, 5, "EDIT", ST77XX_YELLOW);
+
+  const int16_t cardW = 152;
+  const int16_t x = xoff + (t.width() - cardW) / 2;
+  const int8_t ROWS = 8, VISIBLE = 5;
+  const int16_t y0 = 21, step = 20, itemH = 18;
+
+  int8_t first = u.sensIndex - 2;
+  if (first > ROWS - VISIBLE) first = ROWS - VISIBLE;
+  if (first < 0) first = 0;
+
+  char buf[40];
+  for (int8_t r = first; r < first + VISIBLE; r++) {
+    switch (r) {
+      case 0:
+        snprintf(buf, sizeof(buf), "NODE %c", isB ? 'B' : 'A');
+        break;
+      case 1:
+        if (isB) snprintf(buf, sizeof(buf), u.sensStage == 2 ? "FLOW <G%u>" : "FLOW G%u", (unsigned)cfg.flow_pin);
+        else     snprintf(buf, sizeof(buf), "LDR G3 FIXED");
+        break;
+      case 2:
+        snprintf(buf, sizeof(buf), isB ? "SOIL G1 FIXED" : "DHT11 G2 FIXED");
+        break;
+      case 3:
+        snprintf(buf, sizeof(buf), "BATT G0 FIXED");
+        break;
+      case 7: {
+        const AckState& a = d.sensAck[n];
+        const char* st = a.pending ? "SENDING" : (a.lastSendMs == 0 ? "" : (a.ok ? "OK" : "FAIL"));
+        snprintf(buf, sizeof(buf), "SEND %c CFG %s", isB ? 'B' : 'A', st);
+        break;
+      }
+      default: {
+        const uint8_t i = (uint8_t)(r - 4);
+        const Payload::SensorSlotCfg& s = cfg.slot[i];
+        if (s.type == Payload::SENS_NONE) {
+          snprintf(buf, sizeof(buf), u.sensStage == 1 && u.sensIndex == r ? "X%u <OFF>" : "X%u OFF", (unsigned)(i + 1));
+        } else {
+          const char* tn = SensorMap::type_name(s.type);
+          char val[12] = "";
+          if (live[i].valid && live[i].type == s.type && live[i].pin == s.pin) {
+            if (s.type == Payload::SENS_PULSE) snprintf(val, sizeof(val), "=%u.%u", (unsigned)(live[i].value / 10), (unsigned)(live[i].value % 10));
+            else snprintf(val, sizeof(val), "=%u", (unsigned)live[i].value);
+          }
+          bool editType = (u.sensStage == 1 && u.sensIndex == r);
+          bool editPin  = (u.sensStage == 2 && u.sensIndex == r);
+          snprintf(buf, sizeof(buf), "X%u %s%s%s G%s%u%s %s", (unsigned)(i + 1),
+                   editType ? "<" : "", tn, editType ? ">" : "",
+                   editPin ? "<" : "", (unsigned)s.pin, editPin ? ">" : "", val);
+        }
+        break;
+      }
+    }
+    t.drawListItem(x, (int16_t)(y0 + (r - first) * step), cardW, itemH, buf, (u.sensIndex == r));
+  }
+}
+
 static inline void ui_draw_one(const UiDrawContext& c, UiPage p, int16_t xoff) {
   switch (p) {
+    case UiPage::Sensors:       draw_sensors(c, xoff); break;
     case UiPage::Home:          draw_home(c, xoff); break;
     case UiPage::NodeA_Details: draw_nodeA(c, xoff); break;
     case UiPage::NodeB_Details: draw_nodeB(c, xoff); break;
