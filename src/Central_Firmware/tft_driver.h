@@ -58,6 +58,18 @@ public:
     if (_tft) _tft->fillRect(x, y, w, h, c);
   }
 
+  void fillCircle(int16_t x, int16_t y, int16_t r, uint16_t c) {
+    if (_tft) _tft->fillCircle(x, y, r, c);
+  }
+
+  void fillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2, uint16_t c) {
+    if (_tft) _tft->fillTriangle(x0, y0, x1, y1, x2, y2, c);
+  }
+
+  void drawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t c) {
+    if (_tft) _tft->drawLine(x0, y0, x1, y1, c);
+  }
+
   void setTextSmall()  { if (_tft) _tft->setTextSize(1); }
   void setTextMedium() { if (_tft) _tft->setTextSize(2); }
   void setTextLarge()  { if (_tft) _tft->setTextSize(3); }
