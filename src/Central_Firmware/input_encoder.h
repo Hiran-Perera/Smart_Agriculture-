@@ -1,5 +1,7 @@
 #pragma once
 #include <Arduino.h>
+#include "driver/gpio.h"
+#include "esp_timer.h"
 
 // Interrupt-driven rotary encoder + push button.
 //
@@ -57,7 +59,7 @@ static volatile uint8_t  shortCount = 0;
 static volatile uint8_t  longCount = 0;
 
 static void IRAM_ATTR isrAB() {
-  uint8_t cur = (uint8_t)((digitalRead(pinA) << 1) | digitalRead(pinB));
+  uint8_t cur = (uint8_t)((gpio_get_level((gpio_num_t)pinA) << 1) | gpio_get_level((gpio_num_t)pinB));
 
   portENTER_CRITICAL_ISR(&mux);
   int8_t step = qdec[(prevAB << 2) | cur];
@@ -72,8 +74,8 @@ static void IRAM_ATTR isrAB() {
 }
 
 static void IRAM_ATTR isrSw() {
-  uint32_t nowUs = micros();
-  uint8_t level = (uint8_t)digitalRead(pinSw);
+  uint32_t nowUs = (uint32_t)esp_timer_get_time();
+  uint8_t level = (uint8_t)gpio_get_level((gpio_num_t)pinSw);
 
   portENTER_CRITICAL_ISR(&mux);
   if ((uint32_t)(nowUs - btnLastEdgeUs) >= debounceUs && level != btnLevel) {
@@ -118,7 +120,7 @@ public:
     EncIsr::accum = 0;
     EncIsr::detents = 0;
     EncIsr::btnLevel = (uint8_t)digitalRead(_cfg.pinSw);
-    EncIsr::btnLastEdgeUs = micros();
+    EncIsr::btnLastEdgeUs = (uint32_t)esp_timer_get_time();
     EncIsr::pressing = false;
     EncIsr::longFired = false;
     EncIsr::shortCount = 0;

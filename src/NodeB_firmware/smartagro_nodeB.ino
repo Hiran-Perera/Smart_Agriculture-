@@ -33,7 +33,7 @@ static const int LORA_DIO0 = 20;
 // I/O pins (your wiring)
 static const int PIN_SOIL  = 1;   // ADC
 static const int PIN_BATT  = 0;   // ADC
-// Flow sensor pin is user selectable (default GPIO3), see ExtSensors::flow_pin()
+// Flow sensor is a user sensor slot now (default slot 1 = FLOW on GPIO3), see ext_sensors.h
 static const int PIN_RELAY = 2;   // motor gate/driver pin (inverted stage)
 
 static const float BATT_DIVIDER_RATIO = 2.0f;
@@ -178,26 +178,6 @@ static void handle_cfg_pkt(const Link::RxPacket &rx) {
   Link::log_tx(DEV, "ACK_CFG_B", ok, SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId);
 }
 
-static void handle_sensor_pkt(const Link::RxPacket &rx) {
-  if (rx.h.type != CMD_SENSOR_CFG) return;
-  if (rx.h.src != GW_ID) return;
-  if (rx.h.len != sizeof(CmdSensorCfg)) return;
-
-  CmdSensorCfg c;
-  memcpy(&c, rx.plain, sizeof(c));
-
-  AckSensorCfg a;
-  a.ver = 1;
-  a.ok = ExtSensors::set_config(c) ? 1 : 0;
-
-  bool ok = Link::send_enc(SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId, (uint8_t*)&a, sizeof(a), true);
-  Link::log_tx(DEV, "ACK_SENSOR", ok, SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId);
-
-  Serial.print(DEV);
-  Serial.print(" SENSOR cfg ");
-  Serial.println(a.ok ? "applied" : "rejected");
-}
-
 static void handle_motor_pkt(const Link::RxPacket &rx) {
   if (rx.h.type != CMD_RELAY) return;
   if (rx.h.src != GW_ID) return;
@@ -233,7 +213,7 @@ static bool wait_rxack(uint32_t id, uint32_t timeoutMs) {
 
       if (rx.h.type == CMD_RELAY) { handle_motor_pkt(rx); continue; }
       if (rx.h.type == CMD_CFG_B) { handle_cfg_pkt(rx); continue; }
-      if (rx.h.type == CMD_SENSOR_CFG) { handle_sensor_pkt(rx); continue; }
+      if (ExtSensors::handle_packet(rx, SELF_ID, DEV)) continue;
 
       if (rx.h.type == RXACK && rx.h.msgId == id) {
         Serial.print(DEV); Serial.print(" RXACK ok id="); Serial.println(id);
@@ -266,7 +246,7 @@ static void rx_window(uint16_t rxwinMs) {
 
     if (rx.h.type == CMD_RELAY) { handle_motor_pkt(rx); continue; }
     if (rx.h.type == CMD_CFG_B) { handle_cfg_pkt(rx); continue; }
-    if (rx.h.type == CMD_SENSOR_CFG) { handle_sensor_pkt(rx); continue; }
+    if (ExtSensors::handle_packet(rx, SELF_ID, DEV)) continue;
   }
 }
 
@@ -319,7 +299,7 @@ void loop() {
   TelemetryB tb;
   tb.ver = 1;
   tb.soil_raw = SensorsB::read_adc_u16(PIN_SOIL);
-  tb.flow_hz_x10 = ExtSensors::hz_x10(ExtSensors::FLOW_IDX, WINDOW_MS);
+  tb.flow_hz_x10 = ExtSensors::first_flow_hz_x10(WINDOW_MS);
   tb.batt_mV = SensorsB::read_batt_mV(PIN_BATT, BATT_DIVIDER_RATIO);
   tb.relay_state = g_targetOn ? 1 : 0;
 

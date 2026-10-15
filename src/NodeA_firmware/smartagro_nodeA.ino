@@ -42,6 +42,52 @@ static const uint16_t DEF_RXWIN_MS = 1200;
 
 static uint32_t g_msgId = 1;
 
+// DHT11 often fails the first read right after light sleep: retry once (needs >1 s gap).
+static void read_dht(float &h, float &t) {
+  t = dht.readTemperature();
+  h = dht.readHumidity();
+  if (isnan(t) || isnan(h)) {
+    delay(1100);
+    t = dht.readTemperature(false, true);
+    h = dht.readHumidity();
+    if (isnan(t) || isnan(h)) Serial.println("NA DHT11 read failed (check wiring / 10k pull-up on GPIO2)");
+  }
+}
+
+// Gateway commands for this node. Handled in every receive loop, so a command that
+// arrives before the RXACK (or while waiting for it) is never dropped.
+static bool handle_cmd(const Link::RxPacket &rx) {
+  if (ExtSensors::handle_packet(rx, SELF_ID, DEV)) return true;
+
+  if (rx.h.type == CMD_CFG_A && rx.h.src == GW_ID && rx.h.len == sizeof(CmdCfgSleepA)) {
+    CmdCfgSleepA c;
+    memcpy(&c, rx.plain, sizeof(c));
+
+    if (c.period_s < 5) c.period_s = 5;
+    if (c.period_s > 3600) c.period_s = 3600;
+    if (c.rxwin_ms < 100) c.rxwin_ms = 100;
+    if (c.rxwin_ms > 5000) c.rxwin_ms = 5000;
+
+    PowerPolicy::set_period_s(c.period_s);
+    PowerPolicy::set_rxwin_ms(c.rxwin_ms);
+
+    AckCfgSleepA a;
+    a.applied_period_s = c.period_s;
+    a.applied_rxwin_ms = c.rxwin_ms;
+
+    bool ok = Link::send_enc(SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId, (uint8_t*)&a, sizeof(a), true);
+    Link::log_tx(DEV, "ACK_CFG_A", ok, SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId);
+
+    Serial.print(DEV);
+    Serial.print(" CFG applied period_s=");
+    Serial.print(c.period_s);
+    Serial.print(" rxwin_ms=");
+    Serial.println(c.rxwin_ms);
+    return true;
+  }
+  return false;
+}
+
 static bool wait_rxack(uint32_t id, uint32_t timeoutMs) {
   uint32_t t0 = millis();
   while (millis() - t0 < timeoutMs) {
@@ -55,6 +101,7 @@ static bool wait_rxack(uint32_t id, uint32_t timeoutMs) {
       }
 
       if (rx.h.dst != SELF_ID) continue;
+      if (handle_cmd(rx)) continue;
 
       if (rx.h.type == RXACK && rx.h.msgId == id) {
         Serial.print(DEV);
@@ -69,24 +116,6 @@ static bool wait_rxack(uint32_t id, uint32_t timeoutMs) {
   Serial.print(" RXACK timeout id=");
   Serial.println(id);
   return false;
-}
-
-static void handle_sensor_cfg(const Link::RxPacket &rx) {
-  if (rx.h.len != sizeof(CmdSensorCfg)) return;
-
-  CmdSensorCfg c;
-  memcpy(&c, rx.plain, sizeof(c));
-
-  AckSensorCfg a;
-  a.ver = 1;
-  a.ok = ExtSensors::set_config(c) ? 1 : 0;
-
-  bool ok = Link::send_enc(SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId, (uint8_t*)&a, sizeof(a), true);
-  Link::log_tx(DEV, "ACK_SENSOR", ok, SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId);
-
-  Serial.print(DEV);
-  Serial.print(" SENSOR cfg ");
-  Serial.println(a.ok ? "applied" : "rejected");
 }
 
 static void handle_cfg_window(uint16_t rxwinMs) {
@@ -104,36 +133,7 @@ static void handle_cfg_window(uint16_t rxwinMs) {
 
     if (rx.h.dst != SELF_ID) continue;
 
-    if (rx.h.type == CMD_SENSOR_CFG && rx.h.src == GW_ID) {
-      handle_sensor_cfg(rx);
-      continue;
-    }
-
-    if (rx.h.type == CMD_CFG_A && rx.h.src == GW_ID && rx.h.len == sizeof(CmdCfgSleepA)) {
-      CmdCfgSleepA c;
-      memcpy(&c, rx.plain, sizeof(c));
-
-      if (c.period_s < 5) c.period_s = 5;
-      if (c.period_s > 3600) c.period_s = 3600;
-      if (c.rxwin_ms < 100) c.rxwin_ms = 100;
-      if (c.rxwin_ms > 5000) c.rxwin_ms = 5000;
-
-      PowerPolicy::set_period_s(c.period_s);
-      PowerPolicy::set_rxwin_ms(c.rxwin_ms);
-
-      AckCfgSleepA a;
-      a.applied_period_s = c.period_s;
-      a.applied_rxwin_ms = c.rxwin_ms;
-
-      bool ok = Link::send_enc(SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId, (uint8_t*)&a, sizeof(a), true);
-      Link::log_tx(DEV, "ACK_CFG_A", ok, SELF_ID, GW_ID, ACK_CMD, 2, rx.h.msgId);
-
-      Serial.print(DEV);
-      Serial.print(" CFG applied period_s=");
-      Serial.print(c.period_s);
-      Serial.print(" rxwin_ms=");
-      Serial.println(c.rxwin_ms);
-    }
+    handle_cmd(rx);
   }
 }
 
@@ -170,8 +170,8 @@ void loop() {
   ta.ver = 1;
 
   // DHT11 read
-  float h = dht.readHumidity();
-  float tC = dht.readTemperature();
+  float h, tC;
+  read_dht(h, tC);
 
   ta.tempC_x100 = (int16_t)0x8000;
   ta.hum_x100   = (int16_t)0x8000;
@@ -186,7 +186,7 @@ void loop() {
   // User assigned sensors: measure pulses over a short window if any are configured.
   TelemetryX tx;
   const bool haveExt = ExtSensors::any_active();
-  if (ExtSensors::has_pulse_slot()) {
+  if (ExtSensors::has_flow()) {
     ExtSensors::window_begin();
     delay(200);
     ExtSensors::sample(tx, 200);

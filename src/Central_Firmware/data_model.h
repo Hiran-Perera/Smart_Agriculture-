@@ -9,10 +9,11 @@ struct NodeRadio { int16_t rssi=0; float snr=0; };
 
 // Latest value of a user assigned (EXT) sensor as reported by the node.
 struct ExtVal {
-  uint8_t  type = 0;     // Payload::SensorType
-  uint8_t  pin = 0xFF;
-  uint16_t value = 0;
-  bool     valid = false;
+  uint8_t type = 0;      // Payload::SensorType
+  uint8_t pin = 0xFF;
+  int16_t v1 = Payload::VAL_NA;
+  int16_t v2 = Payload::VAL_NA;
+  bool    valid = false;
 };
 
 struct NodeAState {
@@ -24,6 +25,7 @@ struct NodeAState {
   int16_t hum_x100   = (int16_t)0x8000;
 
   uint32_t lastSeenMs=0;
+  uint32_t intervalMs=0;     // measured time between telemetry packets (smoothed)
   NodeRadio radio;
   bool valid=false;
 
@@ -40,6 +42,7 @@ struct NodeBState {
   uint16_t batt_mV=0;
   bool relay_state=false;
   uint32_t lastSeenMs=0;
+  uint32_t intervalMs=0;     // measured time between telemetry packets (smoothed)
   NodeRadio radio;
   bool valid=false;
 
@@ -58,11 +61,18 @@ struct AckState {
   uint32_t lastAckMs=0;
 };
 
+// Sleep timing as edited on the Node Timing page (defaults = node firmware defaults).
 struct ConfigState {
-  uint16_t cfgA_period_s = 10;
-  uint16_t cfgA_rxwin_ms = 250;
-  uint16_t cfgB_period_s = 10;
-  uint16_t cfgB_rxwin_ms = 250;
+  uint16_t cfgA_period_s = 30;
+  uint16_t cfgA_rxwin_ms = 1200;
+  uint16_t cfgB_period_s = 30;
+  uint16_t cfgB_rxwin_ms = 2500;
+};
+
+// Sleep timing a node confirmed it runs (from its ACK, kept in NVS).
+struct NodeTiming {
+  uint16_t period_s;
+  uint16_t rxwin_ms;
 };
 
 struct AutoPumpSettings {
@@ -93,11 +103,21 @@ struct DataModel {
   AckState cfgBAck;
 
   ConfigState cfg;
+  NodeTiming applied[2] = { {30, 1200}, {30, 2500} };
+  bool timingDirty = false;   // applied[] changed, save to NVS
   AutoPumpSettings autoPump;
 
-  // Sensor assignment being edited / last sent, index 0 = Node A, 1 = Node B
+  // Sensor assignment, index 0 = Node A, 1 = Node B.
+  // sensCfg is what the Sensors page edits, sensSent what the node was last sent.
   Payload::CmdSensorCfg sensCfg[2];
+  Payload::CmdSensorCfg sensSent[2];
   AckState sensAck[2];
+
+  // Pump / valve outputs on EXT slots: requested states (bit i = slot i on)
+  uint8_t outTarget[2] = {0, 0};
+  AckState outAck[2];
+
+  const ExtVal* ext(uint8_t n) const { return n ? b.ext : a.ext; }
 
   void reset() { *this = DataModel(); }
 };

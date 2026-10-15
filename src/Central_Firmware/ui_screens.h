@@ -1,9 +1,10 @@
 #pragma once
 #include <Arduino.h>
-#include <Adafruit_ST77xx.h>
 #include "tft_driver.h"
 #include "data_model.h"
 #include "ui_state.h"
+#include "ui_logic.h"
+#include "node_items.h"
 
 struct UiDrawContext {
   uint32_t nowMs = 0;
@@ -12,330 +13,350 @@ struct UiDrawContext {
   const UiState* ui = nullptr;
 };
 
-static inline int16_t transition_offset(const UiState& ui, uint32_t nowMs, int16_t w) {
-  if (!ui.tr.active) return 0;
-  uint32_t dt = nowMs - ui.tr.startMs;
-  float t = (float)dt / (float)ui.tr.durationMs;
-  if (t < 0) t = 0;
-  if (t > 1) t = 1;
-  float u = 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
-  return (int16_t)(u * (float)w);
-}
-
-static inline void draw_center_bg(TftDriver& t, int16_t xoff, int16_t y, const char* s, uint16_t fg) {
-  int16_t x = xoff + t.centerTextX(s, 1);
-  t.drawText(x, y, s, fg, ST77XX_BLACK);
-}
-
+// ---------- shared helpers ----------
 static inline bool is_offline(uint32_t nowMs, uint32_t lastSeenMs, uint32_t timeoutMs) {
   if (lastSeenMs == 0) return true;
   return (uint32_t)(nowMs - lastSeenMs) > timeoutMs;
 }
 
-// Offline timeout based on configured period + rx window + margin.
-// This prevents "OFFLINE" showing after 8 seconds when your period is 10/30/60s.
-static inline uint32_t offline_timeout_ms_A(const DataModel& d) {
-  uint32_t p = (uint32_t)d.cfg.cfgA_period_s * 1000UL;
-  uint32_t w = (uint32_t)d.cfg.cfgA_rxwin_ms;
-  return p + (2 * w) + 3000;
+// A node is offline only when its next packet is overdue: one full wake cycle
+// (sleep period + listen window + sensing/ack time, or the measured gap if longer)
+// plus a grace margin. Sleeping between packets is normal and never shows offline.
+static inline uint32_t offline_timeout_ms(const DataModel& d, uint8_t n) {
+  const NodeTiming& t = d.applied[n];
+  uint32_t cycle = (uint32_t)t.period_s * 1000UL + t.rxwin_ms + 2500UL;
+  const uint32_t measured = n ? d.b.intervalMs : d.a.intervalMs;
+  if (measured > cycle) cycle = measured;
+  return cycle + 5000UL;
+}
+static inline uint32_t offline_timeout_ms_A(const DataModel& d) { return offline_timeout_ms(d, 0); }
+static inline uint32_t offline_timeout_ms_B(const DataModel& d) { return offline_timeout_ms(d, 1); }
+
+static inline uint32_t node_last_seen(const DataModel& d, uint8_t n) { return n ? d.b.lastSeenMs : d.a.lastSeenMs; }
+
+static inline void fmt_age(char* buf, size_t n, uint32_t ms) {
+  uint32_t s = ms / 1000;
+  if (s < 60)        snprintf(buf, n, "%lus", (unsigned long)s);
+  else if (s < 3600) snprintf(buf, n, "%lum", (unsigned long)(s / 60));
+  else               snprintf(buf, n, "%luh", (unsigned long)(s / 3600));
 }
 
-static inline uint32_t offline_timeout_ms_B(const DataModel& d) {
-  uint32_t p = (uint32_t)d.cfg.cfgB_period_s * 1000UL;
-  uint32_t w = (uint32_t)d.cfg.cfgB_rxwin_ms;
-  return p + (2 * w) + 3000;
+// Status text for a command that goes to a node on its next wake-up.
+static inline const char* ack_text(const AckState& a, uint16_t& col) {
+  if (a.pending)        { col = Col::WARN;   return "SENDING"; }
+  if (a.lastSendMs == 0){ col = Col::MUTED;  return ""; }
+  if (a.ok)             { col = Col::ACCENT; return "DONE"; }
+  col = Col::BAD;
+  return "FAILED";
 }
 
-static inline void ui_draw_one(const UiDrawContext& c, UiPage p, int16_t xoff);
+// ---------- scrolling list ----------
+struct Row {
+  char left[24];
+  char right[14];
+  bool editL = false;
+  bool editR = false;
+  uint16_t rcol = Col::MUTED;
+};
 
-static inline void ui_draw(const UiDrawContext& c) {
-  auto& t = *c.tft;
-  int16_t W = t.width();
+static const int16_t LIST_X = 4, LIST_W = 148, LIST_Y0 = 22, ROW_H = 18, ROW_STEP = 21;
+static const int8_t  LIST_VISIBLE = 5;
 
-  bool full = c.ui->dirty || c.ui->tr.active;
+static inline void row_set(Row& r, const char* l, const char* rt = "", uint16_t rc = Col::MUTED) {
+  snprintf(r.left, sizeof(r.left), "%s", l);
+  snprintf(r.right, sizeof(r.right), "%s", rt);
+  r.editL = r.editR = false;
+  r.rcol = rc;
+}
 
-  t.beginFrame();
+static inline void draw_list(TftDriver& t, int16_t xoff, const Row* rows, int8_t n, int8_t sel) {
+  int8_t first = sel - 2;
+  if (first > n - LIST_VISIBLE) first = n - LIST_VISIBLE;
+  if (first < 0) first = 0;
 
-  if (c.ui->tr.active) {
-    t.fillScreen(ST77XX_BLACK);
-    int16_t off = transition_offset(*c.ui, c.nowMs, W);
-    ui_draw_one(c, c.ui->tr.from, -off);
-    ui_draw_one(c, c.ui->tr.to, (W - off));
-    t.endFrame();
-    return;
+  for (int8_t r = first; r < n && r < first + LIST_VISIBLE; r++) {
+    const Row& R = rows[r];
+    t.drawRow(xoff + LIST_X, (int16_t)(LIST_Y0 + (r - first) * ROW_STEP), LIST_W, ROW_H,
+              R.left, R.right, r == sel, R.editL, R.editR, R.rcol);
   }
-
-  if (full) t.fillScreen(ST77XX_BLACK);
-
-  ui_draw_one(c, c.ui->page, 0);
-  t.endFrame();
+  t.drawScrollbar(xoff + LIST_X + LIST_W + 2, LIST_Y0, LIST_VISIBLE * ROW_STEP - 3, first, LIST_VISIBLE, n);
 }
 
+// ---------- HOME ----------
+// Original GATEWAY menu look (plain list, centred labels, green highlight), plus SENSORS.
 static inline void draw_home(const UiDrawContext& c, int16_t xoff) {
   auto& t = *c.tft;
-  const auto& u = *c.ui;
+  const int16_t W = t.width();
 
-  t.drawHeader(xoff, "GATEWAY");
+  // header
+  t.fillRect(xoff, 0, W, 18, ST77XX_BLACK);
+  t.drawFastHLine(xoff, 17, W, ST77XX_GREEN);
+  t.drawText(xoff + t.centerTextX("GATEWAY", 1), 3, "GATEWAY", ST77XX_GREEN);
 
-  const int16_t cardW = 152;
-  const int16_t x = xoff + (t.width() - cardW) / 2;
-
-  const char* items[5] = { "NODE A", "NODE B", "PUMP", "SENSORS", "SETTINGS" };
-
-  const int16_t y0 = 24;
-  const int16_t itemH = 16;
-  const int16_t gap = 4;
+  static const char* items[5] = { "NODE A", "NODE B", "PUMP", "SENSORS", "SETTINGS" };
+  const int16_t cardW = 152, itemH = 16, gap = 4, y0 = 24;
+  const int16_t x = xoff + (W - cardW) / 2;
 
   for (int i = 0; i < 5; i++) {
-    t.drawListItem(x, (int16_t)(y0 + i * (itemH + gap)), cardW, itemH, items[i], (u.homeIndex == i));
+    const bool sel = (c.ui->homeIndex == i);
+    const int16_t y = (int16_t)(y0 + i * (itemH + gap));
+    const uint16_t bg = sel ? ST77XX_GREEN : ST77XX_BLACK;
+    t.fillRect(x, y, cardW, itemH, bg);
+    t.drawRect(x, y, cardW, itemH, sel ? ST77XX_GREEN : ST77XX_LIGHTGREY);
+    t.drawText(x + (cardW - t.textWidth(items[i])) / 2, y + (itemH - 8) / 2, items[i],
+               sel ? ST77XX_BLACK : ST77XX_WHITE);
   }
 }
 
-// "EXT 2048 1 12.3Hz" - values of the enabled user sensors, false if none.
-static inline bool fmt_ext_line(char* buf, size_t n, const ExtVal* e) {
-  size_t len = (size_t)snprintf(buf, n, "EXT");
-  bool any = false;
-  for (uint8_t i = 0; i < Payload::EXT_SLOTS && len < n; i++) {
-    if (!e[i].valid) continue;
-    any = true;
-    if (e[i].type == Payload::SENS_PULSE)
-      len += (size_t)snprintf(buf + len, n - len, " %u.%uHz", (unsigned)(e[i].value / 10), (unsigned)(e[i].value % 10));
-    else
-      len += (size_t)snprintf(buf + len, n - len, " %u", (unsigned)e[i].value);
+// ---------- NODE PAGES (one reading at a time) ----------
+static const int16_t CARD_Y = 22, CARD_H = 76;
+
+// Card layout: [dot LABEL ........ 2/5] / big value + unit (centred on ink) / source line
+static inline void draw_item(TftDriver& t, int16_t xoff, int16_t shift, const NodeItem& it, uint8_t idx, uint8_t count) {
+  const int16_t W = t.width();
+  char buf[8];
+
+  // label row
+  const int16_t ly = CARD_Y + 7 + shift;
+  t.fillCircle(xoff + 13, ly + 3, 2, it.dot);
+  t.drawText(xoff + 19, ly, it.label, Col::MUTED);
+  if (count > 1) {
+    snprintf(buf, sizeof(buf), "%u/%u", (unsigned)(idx + 1), (unsigned)count);
+    t.drawText(xoff + W - 12 - t.textWidth(buf), ly, buf, Col::MUTED);
   }
-  return any;
+  t.drawFastHLine(xoff + 10, CARD_Y + 19 + shift, W - 20, Col::BORDER);
+
+  // value + unit, centred on the actual ink width
+  const bool na = (strcmp(it.value, "--") == 0);
+  const bool deg = (strcmp(it.unit, "C") == 0);
+  const int16_t gap = 3, degW = deg ? 6 : 0;
+
+  int16_t ux1 = 0, uw = 0;
+  if (it.unit[0] && !na) t.bigBounds(it.unit, 2, ux1, uw);
+  const int16_t unitW = uw ? degW + uw : 0;
+
+  uint8_t size = 1;
+  int16_t vx1, vw;
+  t.bigBounds(it.value, size, vx1, vw);
+  if (vw + (unitW ? gap + unitW : 0) > W - 24) { size = 0; t.bigBounds(it.value, size, vx1, vw); }
+
+  const int16_t total = vw + (unitW ? gap + unitW : 0);
+  const int16_t left = xoff + (W - total) / 2;
+  const int16_t base = CARD_Y + 51 + shift;
+  t.drawBig(left - vx1, base, it.value, size, na ? Col::MUTED : it.color);
+
+  if (unitW) {
+    int16_t ux = left + vw + gap;
+    if (deg) { t.drawCircle(ux + 2, base - 11, 2, Col::MUTED); ux += degW; }
+    t.drawBig(ux - ux1, base, it.unit, 2, Col::MUTED);
+  }
+
+  // source line (sensor + pin, raw value)
+  t.drawText(xoff + (W - t.textWidth(it.sub)) / 2, CARD_Y + 61 + shift, it.sub, Col::MUTED);
 }
 
-static inline void draw_nodeA(const UiDrawContext& c, int16_t xoff) {
+static inline void draw_node(const UiDrawContext& c, int16_t xoff, uint8_t n) {
   auto& t = *c.tft;
   const auto& d = *c.data;
+  const auto& u = *c.ui;
+  const int16_t W = t.width();
+  char buf[32], age[8];
 
-  t.drawHeader(xoff, "NODE A");
+  const uint32_t seen = node_last_seen(d, n);
+  const bool valid = n ? d.b.valid : d.a.valid;
+  const bool off = !valid || is_offline(c.nowMs, seen, offline_timeout_ms(d, n));
 
-  const int16_t cardW = 152;
-  const int16_t x = xoff + (t.width() - cardW) / 2;
-  t.drawCard(x, 28, cardW, 92);
+  t.drawCard(xoff + 4, CARD_Y, W - 8, CARD_H);
 
-  const bool off = is_offline(c.nowMs, d.a.lastSeenMs, offline_timeout_ms_A(d));
-  if (!d.a.valid || off) {
-    draw_center_bg(t, xoff, 66, "OFFLINE", ST77XX_LIGHTGREY);
-    return;
+  uint8_t count = 0;
+  if (off) {
+    const char* big = "OFFLINE";
+    t.drawBig(xoff + (W - t.bigWidth(big, 0)) / 2, CARD_Y + 45, big, 0, Col::MUTED);
+    if (seen == 0) snprintf(buf, sizeof(buf), "waiting for first packet");
+    else { fmt_age(age, sizeof(age), c.nowMs - seen); snprintf(buf, sizeof(buf), "last seen %s ago", age); }
+    t.drawText(xoff + (W - t.textWidth(buf)) / 2, CARD_Y + 58, buf, Col::MUTED);
+  } else {
+    NodeItem items[NODE_ITEMS_MAX];
+    count = node_items(d, n, items, NODE_ITEMS_MAX);
+    const uint8_t cur = count ? (uint8_t)(u.nodeItem % count) : 0;
+
+    if (count && u.itemAnim) {
+      const float e = ui_ease(c.nowMs, u.itemAnimStartMs, ITEM_ANIM_MS);
+      const int16_t dist = 44;
+      const int16_t s = (int16_t)(e * dist);
+      draw_item(t, xoff, (int16_t)(-u.itemDir * s), items[u.nodeItemPrev % count], (uint8_t)(u.nodeItemPrev % count), count);
+      draw_item(t, xoff, (int16_t)(u.itemDir * (dist - s)), items[cur], cur, count);
+    } else if (count) {
+      draw_item(t, xoff, 0, items[cur], cur, count);
+    }
+
+    // clip the sliding content to the card
+    t.fillRect(xoff, 0, W, CARD_Y + 1, Col::BG);
+    t.fillRect(xoff, CARD_Y + CARD_H - 1, W, t.height() - (CARD_Y + CARD_H - 1), Col::BG);
+    t.fillRect(xoff + 5, CARD_Y + 1, W - 10, 1, Col::PANEL);
+    t.fillRect(xoff + 5, CARD_Y + CARD_H - 2, W - 10, 1, Col::PANEL);
+    t.drawRoundRect(xoff + 4, CARD_Y, W - 8, CARD_H, 4, Col::BORDER);
+
+    // position dots
+    if (count > 1) {
+      const int16_t sp = 8;
+      int16_t x0 = xoff + (W - (count - 1) * sp) / 2;
+      for (uint8_t i = 0; i < count; i++) {
+        if (i == cur) t.fillCircle(x0 + i * sp, 104, 2, Col::ACCENT);
+        else          t.fillCircle(x0 + i * sp, 104, 1, Col::BORDER);
+      }
+    }
   }
 
-  char buf[48];
-  t.setTextSmall();
+  t.drawHeader(xoff, n ? "NODE B" : "NODE A");
+  t.fillCircle(xoff + 10, 8, 3, seen == 0 ? Col::BORDER : (off ? Col::BAD : Col::ACCENT));
 
-  snprintf(buf, sizeof(buf), "LIGHT %u", (unsigned)d.a.light_raw);
-  draw_center_bg(t, xoff, 40, buf, ST77XX_WHITE);
+  // footer: battery left, age + signal right
+  if (valid) {
+    const uint16_t mv = n ? d.b.batt_mV : d.a.batt_mV;
+    snprintf(buf, sizeof(buf), "BAT %u.%02uV", mv / 1000, (mv % 1000) / 10);
+    t.drawText(xoff + 6, 116, buf, mv < 3300 ? Col::WARN : Col::MUTED);
 
-  snprintf(buf, sizeof(buf), "BATT %u mV", (unsigned)d.a.batt_mV);
-  draw_center_bg(t, xoff, 54, buf, ST77XX_WHITE);
-
-  if (d.a.tempC_x100 == (int16_t)0x8000) snprintf(buf, sizeof(buf), "TEMP NA");
-  else snprintf(buf, sizeof(buf), "TEMP %.2fC", d.a.tempC_x100 / 100.0f);
-  draw_center_bg(t, xoff, 68, buf, ST77XX_WHITE);
-
-  if (d.a.hum_x100 == (int16_t)0x8000) snprintf(buf, sizeof(buf), "HUM NA");
-  else snprintf(buf, sizeof(buf), "HUM %.2f%%", d.a.hum_x100 / 100.0f);
-  draw_center_bg(t, xoff, 82, buf, ST77XX_WHITE);
-
-  if (fmt_ext_line(buf, sizeof(buf), d.a.ext)) draw_center_bg(t, xoff, 93, buf, ST77XX_CYAN);
-
-  uint32_t age = (uint32_t)((c.nowMs - d.a.lastSeenMs) / 1000);
-  snprintf(buf, sizeof(buf), "LAST %lus", (unsigned long)age);
-  draw_center_bg(t, xoff, 104, buf, ST77XX_GREEN);
-}
-
-static inline void draw_nodeB(const UiDrawContext& c, int16_t xoff) {
-  auto& t = *c.tft;
-  const auto& d = *c.data;
-
-  t.drawHeader(xoff, "NODE B");
-
-  const int16_t cardW = 152;
-  const int16_t x = xoff + (t.width() - cardW) / 2;
-  t.drawCard(x, 28, cardW, 92);
-
-  const bool off = is_offline(c.nowMs, d.b.lastSeenMs, offline_timeout_ms_B(d));
-  if (!d.b.valid || off) {
-    draw_center_bg(t, xoff, 66, "OFFLINE", ST77XX_LIGHTGREY);
-    return;
+    fmt_age(age, sizeof(age), c.nowMs - seen);
+    snprintf(buf, sizeof(buf), "%s  %ddB", age, n ? d.b.rssi : d.a.rssi);
+    t.drawText(xoff + W - 6 - t.textWidth(buf), 116, buf, Col::MUTED);
   }
-
-  char buf[48];
-  t.setTextSmall();
-
-  snprintf(buf, sizeof(buf), "SOIL %u", (unsigned)d.b.soil_raw);
-  draw_center_bg(t, xoff, 40, buf, ST77XX_WHITE);
-
-  snprintf(buf, sizeof(buf), "FLOW %u.%u HZ", (unsigned)(d.b.flow_hz_x10 / 10), (unsigned)(d.b.flow_hz_x10 % 10));
-  draw_center_bg(t, xoff, 54, buf, ST77XX_WHITE);
-
-  snprintf(buf, sizeof(buf), "BATT %u mV", (unsigned)d.b.batt_mV);
-  draw_center_bg(t, xoff, 68, buf, ST77XX_WHITE);
-
-  snprintf(buf, sizeof(buf), "RELAY %s", d.b.relay_state ? "ON" : "OFF");
-  draw_center_bg(t, xoff, 82, buf, d.b.relay_state ? ST77XX_GREEN : ST77XX_RED);
-
-  if (fmt_ext_line(buf, sizeof(buf), d.b.ext)) draw_center_bg(t, xoff, 93, buf, ST77XX_CYAN);
-
-  uint32_t age = (uint32_t)((c.nowMs - d.b.lastSeenMs) / 1000);
-  snprintf(buf, sizeof(buf), "LAST %lus", (unsigned long)age);
-  draw_center_bg(t, xoff, 104, buf, ST77XX_GREEN);
 }
 
+// ---------- PUMP / OUTPUTS ----------
 static inline void draw_relay(const UiDrawContext& c, int16_t xoff) {
   auto& t = *c.tft;
   const auto& d = *c.data;
   const auto& u = *c.ui;
+  char buf[16];
 
-  t.drawHeader(xoff, "PUMP");
+  t.drawHeader(xoff, "PUMP CONTROL");
 
-  const int16_t cardW = 152;
-  const int16_t x = xoff + (t.width() - cardW) / 2;
+  OutRow outs[2 * Payload::EXT_SLOTS];
+  const uint8_t nOut = output_rows(d, outs, 2 * Payload::EXT_SLOTS);
+  Row rows[RELAY_FIXED_ROWS + 2 * Payload::EXT_SLOTS];
 
-  char buf[48];
+  if (d.relayAck.pending) row_set(rows[0], "MAIN PUMP", "SENDING", Col::WARN);
+  else if (!d.b.valid)    row_set(rows[0], "MAIN PUMP", "--");
+  else row_set(rows[0], "MAIN PUMP", d.b.relay_state ? "ON" : "OFF", d.b.relay_state ? Col::ACCENT : Col::MUTED);
 
-  snprintf(buf, sizeof(buf), "MANUAL %s", d.relay_target_on ? "ON" : "OFF");
-  t.drawListItem(x, 28, cardW, 18, buf, (u.relayIndex == 0));
+  row_set(rows[1], "AUTO MODE", d.autoPump.enabled ? "ON" : "OFF", d.autoPump.enabled ? Col::ACCENT : Col::MUTED);
+  snprintf(buf, sizeof(buf), "%u", (unsigned)d.autoPump.soil_on_threshold);
+  row_set(rows[2], "ON  IF RAW >", buf, Col::TEXT);
+  snprintf(buf, sizeof(buf), "%u", (unsigned)d.autoPump.soil_off_threshold);
+  row_set(rows[3], "OFF IF RAW <", buf, Col::TEXT);
+  snprintf(buf, sizeof(buf), "%us", (unsigned)d.autoPump.cooldown_sec);
+  row_set(rows[4], "COOLDOWN", buf, Col::TEXT);
+  if (u.relayEdit && u.relayIndex >= 2 && u.relayIndex <= 4) rows[u.relayIndex].editR = true;
 
-  t.drawListItem(x, 52, cardW, 18, "SEND", (u.relayIndex == 1));
+  for (uint8_t i = 0; i < nOut; i++) {
+    const OutRow& o = outs[i];
+    const bool on = output_states(d, o.node) & (1 << o.slot);
+    char left[24];
+    snprintf(left, sizeof(left), "%c%u %s  G%u", o.node ? 'B' : 'A', (unsigned)(o.slot + 1),
+             SensorMap::type_name(d.sensSent[o.node].slot[o.slot].type), (unsigned)d.sensSent[o.node].slot[o.slot].pin);
+    if (d.outAck[o.node].pending) row_set(rows[RELAY_FIXED_ROWS + i], left, on ? "ON.." : "OFF..", Col::WARN);
+    else row_set(rows[RELAY_FIXED_ROWS + i], left, on ? "ON" : "OFF", on ? Col::ACCENT : Col::MUTED);
+  }
 
-  snprintf(buf, sizeof(buf), "AUTO %s", d.autoPump.enabled ? "ON" : "OFF");
-  t.drawListItem(x, 76, cardW, 18, buf, (u.relayIndex == 2));
-
-  snprintf(buf, sizeof(buf), "ON TH %u", (unsigned)d.autoPump.soil_on_threshold);
-  t.drawListItem(x, 100, cardW, 18, buf, (u.relayIndex == 3));
-
-  if (u.relayEdit) t.drawTextNoBg(xoff + 126, 10, "EDIT", ST77XX_YELLOW);
+  draw_list(t, xoff, rows, (int8_t)(RELAY_FIXED_ROWS + nOut), u.relayIndex);
 }
 
-static inline void draw_settings1(const UiDrawContext& c, int16_t xoff) {
+// ---------- SETTINGS ----------
+static inline void draw_settings(const UiDrawContext& c, int16_t xoff) {
   auto& t = *c.tft;
   const auto& d = *c.data;
   const auto& u = *c.ui;
+  char buf[14];
+  uint16_t col;
 
-  t.drawHeader(xoff, "SETTINGS A");
+  t.drawHeader(xoff, "NODE TIMING");
 
-  const int16_t cardW = 152;
-  const int16_t x = xoff + (t.width() - cardW) / 2;
+  Row rows[SETTINGS_ROWS];
+  snprintf(buf, sizeof(buf), "%us", (unsigned)d.cfg.cfgA_period_s);
+  row_set(rows[0], "A WAKE EVERY", buf, Col::TEXT);
+  snprintf(buf, sizeof(buf), "%ums", (unsigned)d.cfg.cfgA_rxwin_ms);
+  row_set(rows[1], "A LISTEN FOR", buf, Col::TEXT);
+  const char* st = ack_text(d.cfgAAck, col);
+  row_set(rows[2], "SEND TO NODE A", st, col);
 
-  char buf[48];
+  snprintf(buf, sizeof(buf), "%us", (unsigned)d.cfg.cfgB_period_s);
+  row_set(rows[3], "B WAKE EVERY", buf, Col::TEXT);
+  snprintf(buf, sizeof(buf), "%ums", (unsigned)d.cfg.cfgB_rxwin_ms);
+  row_set(rows[4], "B LISTEN FOR", buf, Col::TEXT);
+  st = ack_text(d.cfgBAck, col);
+  row_set(rows[5], "SEND TO NODE B", st, col);
 
-  snprintf(buf, sizeof(buf), "A PERIOD %us", (unsigned)d.cfg.cfgA_period_s);
-  t.drawListItem(x, 28, cardW, 18, buf, (u.settingsIndex1 == 0));
-
-  snprintf(buf, sizeof(buf), "A RXWIN %ums", (unsigned)d.cfg.cfgA_rxwin_ms);
-  t.drawListItem(x, 52, cardW, 18, buf, (u.settingsIndex1 == 1));
-
-  t.drawListItem(x, 76, cardW, 18, "SEND A", (u.settingsIndex1 == 2));
-
-  draw_center_bg(t, xoff, 110, "ROTATE FOR NEXT", ST77XX_LIGHTGREY);
-  if (u.settingsEdit1) t.drawTextNoBg(xoff + 126, 10, "EDIT", ST77XX_YELLOW);
+  if (u.settingsEdit) rows[u.settingsIndex].editR = true;
+  draw_list(t, xoff, rows, SETTINGS_ROWS, u.settingsIndex);
 }
 
-static inline void draw_settings2(const UiDrawContext& c, int16_t xoff) {
-  auto& t = *c.tft;
-  const auto& d = *c.data;
-  const auto& u = *c.ui;
-
-  t.drawHeader(xoff, "SETTINGS B");
-
-  const int16_t cardW = 152;
-  const int16_t x = xoff + (t.width() - cardW) / 2;
-
-  char buf[48];
-
-  snprintf(buf, sizeof(buf), "B PERIOD %us", (unsigned)d.cfg.cfgB_period_s);
-  t.drawListItem(x, 28, cardW, 18, buf, (u.settingsIndex2 == 0));
-
-  snprintf(buf, sizeof(buf), "B RXWIN %ums", (unsigned)d.cfg.cfgB_rxwin_ms);
-  t.drawListItem(x, 52, cardW, 18, buf, (u.settingsIndex2 == 1));
-
-  t.drawListItem(x, 76, cardW, 18, "SEND B", (u.settingsIndex2 == 2));
-
-  draw_center_bg(t, xoff, 110, "ROTATE FOR HOME", ST77XX_LIGHTGREY);
-  if (u.settingsEdit2) t.drawTextNoBg(xoff + 126, 10, "EDIT", ST77XX_YELLOW);
-}
-
+// ---------- SENSORS (assignable slots only) ----------
 static inline void draw_sensors(const UiDrawContext& c, int16_t xoff) {
   auto& t = *c.tft;
   const auto& d = *c.data;
   const auto& u = *c.ui;
-
   const uint8_t n = u.sensNode;
-  const bool isB = (n == 1);
   const Payload::CmdSensorCfg& cfg = d.sensCfg[n];
-  const ExtVal* live = isB ? d.b.ext : d.a.ext;
+  char l[24], r[14];
 
-  t.drawHeader(xoff, "SENSORS");
-  if (u.sensStage) t.drawTextNoBg(xoff + 126, 5, "EDIT", ST77XX_YELLOW);
+  t.drawHeader(xoff, n ? "SENSORS  NODE B" : "SENSORS  NODE A");
+  if (u.sensStage) t.drawText(xoff + t.width() - 28, 5, u.sensStage == 1 ? "TYPE" : "PIN", Col::EDIT);
 
-  const int16_t cardW = 152;
-  const int16_t x = xoff + (t.width() - cardW) / 2;
-  const int8_t ROWS = 8, VISIBLE = 5;
-  const int16_t y0 = 21, step = 20, itemH = 18;
+  Row rows[SENS_ROWS];
+  row_set(rows[0], n ? "NODE B" : "NODE A", "PRESS: SWITCH");
 
-  int8_t first = u.sensIndex - 2;
-  if (first > ROWS - VISIBLE) first = ROWS - VISIBLE;
-  if (first < 0) first = 0;
+  for (uint8_t i = 0; i < Payload::EXT_SLOTS; i++) {
+    const Payload::SensorSlotCfg& s = cfg.slot[i];
+    Row& R = rows[1 + i];
+    snprintf(l, sizeof(l), "%u  %s", (unsigned)(i + 1), SensorMap::type_name(s.type));
+    if (s.type == Payload::SENS_NONE) snprintf(r, sizeof(r), "--");
+    else snprintf(r, sizeof(r), "GPIO %u", (unsigned)s.pin);
+    row_set(R, l, r, s.type == Payload::SENS_NONE ? Col::BORDER : Col::TEXT);
+    if (u.sensIndex == 1 + i) { R.editL = (u.sensStage == 1); R.editR = (u.sensStage == 2); }
+  }
 
-  char buf[40];
-  for (int8_t r = first; r < first + VISIBLE; r++) {
-    switch (r) {
-      case 0:
-        snprintf(buf, sizeof(buf), "NODE %c", isB ? 'B' : 'A');
-        break;
-      case 1:
-        if (isB) snprintf(buf, sizeof(buf), u.sensStage == 2 ? "FLOW <G%u>" : "FLOW G%u", (unsigned)cfg.flow_pin);
-        else     snprintf(buf, sizeof(buf), "LDR G3 FIXED");
-        break;
-      case 2:
-        snprintf(buf, sizeof(buf), isB ? "SOIL G1 FIXED" : "DHT11 G2 FIXED");
-        break;
-      case 3:
-        snprintf(buf, sizeof(buf), "BATT G0 FIXED");
-        break;
-      case 7: {
-        const AckState& a = d.sensAck[n];
-        const char* st = a.pending ? "SENDING" : (a.lastSendMs == 0 ? "" : (a.ok ? "OK" : "FAIL"));
-        snprintf(buf, sizeof(buf), "SEND %c CFG %s", isB ? 'B' : 'A', st);
-        break;
-      }
-      default: {
-        const uint8_t i = (uint8_t)(r - 4);
-        const Payload::SensorSlotCfg& s = cfg.slot[i];
-        if (s.type == Payload::SENS_NONE) {
-          snprintf(buf, sizeof(buf), u.sensStage == 1 && u.sensIndex == r ? "X%u <OFF>" : "X%u OFF", (unsigned)(i + 1));
-        } else {
-          const char* tn = SensorMap::type_name(s.type);
-          char val[12] = "";
-          if (live[i].valid && live[i].type == s.type && live[i].pin == s.pin) {
-            if (s.type == Payload::SENS_PULSE) snprintf(val, sizeof(val), "=%u.%u", (unsigned)(live[i].value / 10), (unsigned)(live[i].value % 10));
-            else snprintf(val, sizeof(val), "=%u", (unsigned)live[i].value);
-          }
-          bool editType = (u.sensStage == 1 && u.sensIndex == r);
-          bool editPin  = (u.sensStage == 2 && u.sensIndex == r);
-          snprintf(buf, sizeof(buf), "X%u %s%s%s G%s%u%s %s", (unsigned)(i + 1),
-                   editType ? "<" : "", tn, editType ? ">" : "",
-                   editPin ? "<" : "", (unsigned)s.pin, editPin ? ">" : "", val);
-        }
-        break;
-      }
-    }
-    t.drawListItem(x, (int16_t)(y0 + (r - first) * step), cardW, itemH, buf, (u.sensIndex == r));
+  uint16_t col;
+  const char* st;
+  const bool unsent = SensorMap::differs(cfg, d.sensSent[n]);
+  if (d.sensAck[n].pending)            { st = "SENDING"; col = Col::WARN; }
+  else if (unsent)                     { st = (d.sensAck[n].lastSendMs && !d.sensAck[n].ok) ? "FAILED" : "UNSENT";
+                                         col = (st[0] == 'F') ? Col::BAD : Col::WARN; }
+  else                                 { st = ack_text(d.sensAck[n], col); if (!*st) { st = "SAVED"; col = Col::MUTED; } }
+  snprintf(l, sizeof(l), "SEND TO NODE %c", n ? 'B' : 'A');
+  row_set(rows[SENS_ROWS - 1], l, st, col);
+
+  draw_list(t, xoff, rows, SENS_ROWS, u.sensIndex);
+}
+
+// ---------- frame ----------
+static inline void ui_draw_one(const UiDrawContext& c, UiPage p, int16_t xoff) {
+  switch (p) {
+    case UiPage::Home:          draw_home(c, xoff); break;
+    case UiPage::NodeA_Details: draw_node(c, xoff, 0); break;
+    case UiPage::NodeB_Details: draw_node(c, xoff, 1); break;
+    case UiPage::Relay:         draw_relay(c, xoff); break;
+    case UiPage::Sensors:       draw_sensors(c, xoff); break;
+    case UiPage::Settings:      draw_settings(c, xoff); break;
+    default: break;
   }
 }
 
-static inline void ui_draw_one(const UiDrawContext& c, UiPage p, int16_t xoff) {
-  switch (p) {
-    case UiPage::Sensors:       draw_sensors(c, xoff); break;
-    case UiPage::Home:          draw_home(c, xoff); break;
-    case UiPage::NodeA_Details: draw_nodeA(c, xoff); break;
-    case UiPage::NodeB_Details: draw_nodeB(c, xoff); break;
-    case UiPage::Relay:         draw_relay(c, xoff); break;
-    case UiPage::Settings1:     draw_settings1(c, xoff); break;
-    case UiPage::Settings2:     draw_settings2(c, xoff); break;
-    default: break;
+static inline void ui_draw(const UiDrawContext& c) {
+  auto& t = *c.tft;
+  const auto& u = *c.ui;
+  const int16_t W = t.width();
+
+  t.beginFrame();
+  t.fillScreen(Col::BG);
+
+  if (u.tr.active) {
+    const int16_t off = (int16_t)(ui_ease(c.nowMs, u.tr.startMs, u.tr.durationMs) * W);
+    ui_draw_one(c, u.tr.from, (int16_t)(-u.tr.dir * off));
+    ui_draw_one(c, u.tr.to,   (int16_t)(u.tr.dir * (W - off)));
+  } else {
+    ui_draw_one(c, u.page, 0);
   }
+
+  t.endFrame();
 }

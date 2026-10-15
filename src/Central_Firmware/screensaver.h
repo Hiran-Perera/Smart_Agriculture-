@@ -1,73 +1,77 @@
 #pragma once
 #include <Arduino.h>
-#include <Adafruit_ST77xx.h>
 #include "tft_driver.h"
+#include "ui_state.h"
+#include "logo_fieldlink.h"
 
-// Black screen with a mint-green gateway glyph (dot rows + bar) and a sprout.
-// The dots ripple slowly; only that small area is redrawn.
+// SmartAgro FIELDLINK screensaver.
+// It slides in over the current page (like a page change) and slides back out
+// on the first knob touch, revealing the page again. While shown it is static
+// (the LCD has no burn-in), so it costs nothing.
 struct ScreenSaver {
-  static constexpr uint16_t MINT = 0x6795;   // bright mint green
-  static constexpr uint16_t DIM  = 0x1AC9;   // dark green for idle dots
+  // Draws the UI page underneath at a horizontal offset (into the frame buffer).
+  using DrawUnder = void (*)(int16_t xoff, uint32_t now);
 
+  enum State : uint8_t { OFF, ENTER, SHOW, EXIT };
+
+  static const uint16_t SLIDE_IN_MS  = 420;
+  static const uint16_t SLIDE_OUT_MS = 260;
+
+  State st = OFF;
+  uint32_t t0 = 0;
   bool drawn = false;
-  uint32_t lastAnimMs = 0;
-  uint8_t phase = 0;
 
-  void reset(uint32_t now) { drawn = false; lastAnimMs = now; phase = 0; }
+  void start(uint32_t now) { st = ENTER; t0 = now; drawn = false; }
+  void stop(uint32_t now) {
+    if (st == OFF || st == EXIT) return;
+    // leaving mid-entry: continue from where the slide currently is
+    float p = (st == ENTER) ? ui_ease(now, t0, SLIDE_IN_MS) : 1.0f;
+    st = EXIT;
+    t0 = now - (uint32_t)((1.0f - p) * SLIDE_OUT_MS);
+  }
+  bool active() const  { return st != OFF; }
+  bool exiting() const { return st == EXIT; }
 
-  bool tick(TftDriver& t, uint32_t now) {
-    if (!drawn) {
-      drawn = true;
-      t.beginFrame();
-      t.fill(ST77XX_BLACK);
-      draw_leaf_(t);
-      draw_glyph_(t);
-      t.endFrame();
-      return true;
+  // Call every loop while active().
+  void tick(TftDriver& t, uint32_t now, DrawUnder under) {
+    const int16_t W = t.width();
+
+    switch (st) {
+      case ENTER: {
+        const int16_t off = (int16_t)(ui_ease(now, t0, SLIDE_IN_MS) * W);
+        frame_(t, now, under, (int16_t)(W - off), (int16_t)(-off));
+        if ((uint32_t)(now - t0) >= SLIDE_IN_MS) { st = SHOW; drawn = true; }
+      } break;
+
+      case SHOW:
+        if (!drawn) { frame_(t, now, under, 0, W); drawn = true; }
+        break;
+
+      case EXIT: {
+        const int16_t off = (int16_t)(ui_ease(now, t0, SLIDE_OUT_MS) * W);
+        frame_(t, now, under, off, (int16_t)(off - W));
+        if ((uint32_t)(now - t0) >= SLIDE_OUT_MS) st = OFF;
+      } break;
+
+      default: break;
     }
-
-    if ((uint32_t)(now - lastAnimMs) < 400) return false;
-    lastAnimMs = now;
-    phase = (uint8_t)((phase + 1) % 8);
-    draw_glyph_(t);
-    return true;
   }
 
 private:
-  // Glyph centred around x=48, y=64: 4 dots, a wide bar, 4 dots.
-  void draw_glyph_(TftDriver& t) {
-    const int16_t d = 7, gap = 4;
-    const int16_t rowW = 4 * d + 3 * gap;          // 40
-    const int16_t x0 = 48 - rowW / 2;
-    const int16_t y0 = 64 - (3 * d + 2 * gap) / 2; // 3 rows
-
-    for (uint8_t i = 0; i < 4; i++) {
-      t.fillRect(x0 + i * (d + gap), y0, d, d, lit_(i));
-      t.fillRect(x0 + i * (d + gap), y0 + 2 * (d + gap), d, d, lit_((uint8_t)(i + 4)));
-    }
-    // middle bar, narrower than the rows like the reference
-    t.fillRect(x0 + d + gap / 2, y0 + d + gap, 2 * d + gap, d, MINT);
+  void frame_(TftDriver& t, uint32_t now, DrawUnder under, int16_t saverX, int16_t pageX) {
+    t.beginFrame();
+    t.fillScreen(Col::BG);
+    if (under && pageX > -t.width() && pageX < t.width()) under(pageX, now);
+    draw_saver_(t, saverX);
+    t.endFrame();
   }
 
-  // Dim dots with a bright wave travelling over the 8 dot positions.
-  uint16_t lit_(uint8_t idx) const {
-    uint8_t dist = (uint8_t)((idx + 8 - phase) % 8);
-    return dist < 3 ? MINT : DIM;
-  }
-
-  // Two-leaf sprout centred around x=112, y=64.
-  void draw_leaf_(TftDriver& t) {
-    const int16_t cx = 112, by = 82;
-    // left leaf (points up-left)
-    t.fillTriangle(cx - 1, by,      cx - 22, by - 6,  cx - 12, by - 26, MINT);
-    t.fillTriangle(cx - 1, by,      cx - 12, by - 26, cx - 1,  by - 14,  MINT);
-    t.fillCircle(cx - 12, by - 10, 8, MINT);
-    // right leaf (larger, points up-right)
-    t.fillTriangle(cx + 1, by - 4,  cx + 24, by - 12, cx + 12, by - 36, MINT);
-    t.fillTriangle(cx + 1, by - 4,  cx + 12, by - 36, cx + 1,  by - 22, MINT);
-    t.fillCircle(cx + 12, by - 18, 10, MINT);
-    // vein cut-outs
-    t.drawLine(cx - 2, by - 2, cx - 14, by - 18, ST77XX_BLACK);
-    t.drawLine(cx + 2, by - 6, cx + 14, by - 26, ST77XX_BLACK);
+  static void draw_saver_(TftDriver& t, int16_t xoff) {
+    const int16_t W = t.width(), H = t.height();
+    if (xoff >= W || xoff <= -W) return;
+    t.fillRect(xoff, 0, W, H, FIELDLINK_BG);
+    const int16_t x = xoff + (W - (int16_t)FIELDLINK_W) / 2;
+    const int16_t y = (H - (int16_t)FIELDLINK_H) / 2;
+    t.drawRGB565_P(x, y, logo_fieldlink, FIELDLINK_W, FIELDLINK_H);
   }
 };

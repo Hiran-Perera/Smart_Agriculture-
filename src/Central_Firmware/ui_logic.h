@@ -3,220 +3,225 @@
 #include "ui_state.h"
 #include "data_model.h"
 #include "input_encoder.h"
+#include "node_items.h"
+
+// Navigation rules (same on every page):
+//   rotate        move the selection / change the value being edited
+//   short press   open / toggle / start or confirm editing
+//   long press    back to Home from anywhere (cancels editing)
+//   rotate above the first row of a list = back to Home
 
 struct UiActions {
   bool requestPageChange = false;
   UiPage nextPage = UiPage::Home;
+  int8_t dir = 1;                 // slide direction
 
-  bool sendRelayToggle = false;
+  bool sendRelay = false;
   bool relayTargetOn = false;
 
   bool sendCfgA = false;
-  uint16_t cfgA_period_s = 10;
-  uint16_t cfgA_rxwin_ms = 400;
-
   bool sendCfgB = false;
-  uint16_t cfgB_period_s = 10;
-  uint16_t cfgB_rxwin_ms = 400;
 
   bool autoSave = false;
 
   bool sendSens = false;
   uint8_t sensNode = 0;
+
+  bool sendOut = false;
+  uint8_t outNode = 0;
+  uint8_t outStates = 0;
 };
 
-static inline uint16_t clamp_u16(int32_t v, uint16_t lo, uint16_t hi) {
-  if (v < (int32_t)lo) return lo;
-  if (v > (int32_t)hi) return hi;
-  return (uint16_t)v;
+static const uint32_t NODE_CYCLE_MS = 3500;     // auto advance on node pages
+static const uint32_t NODE_PAUSE_MS = 10000;    // pause after manual browsing
+static const int8_t   SENS_ROWS = 1 + Payload::EXT_SLOTS + 1;
+static const int8_t   SETTINGS_ROWS = 6;
+static const int8_t   RELAY_FIXED_ROWS = 5;
+
+static inline int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static inline uint16_t clamp_u16(int32_t v, uint16_t lo, uint16_t hi) { return (uint16_t)clamp_i32(v, lo, hi); }
+
+// ---------- pump / valve outputs (listed on the Pump page) ----------
+struct OutRow { uint8_t node; uint8_t slot; };
+
+static inline uint8_t output_rows(const DataModel& d, OutRow* out, uint8_t max) {
+  uint8_t c = 0;
+  for (uint8_t n = 0; n < 2; n++)
+    for (uint8_t i = 0; i < Payload::EXT_SLOTS && c < max; i++)
+      if (SensorMap::is_output(d.sensSent[n].slot[i].type)) out[c++] = { n, i };
+  return c;
 }
 
-static inline void ui_go_home(UiState& ui, UiActions& act) {
-  ui.sensStage = 0;
+// Current states of a node's outputs: the request while it is in flight, else what the node reports.
+static inline uint8_t output_states(const DataModel& d, uint8_t n) {
+  if (d.outAck[n].pending) return d.outTarget[n];
+  uint8_t s = 0;
+  const ExtVal* e = d.ext(n);
+  for (uint8_t i = 0; i < Payload::EXT_SLOTS; i++) {
+    if (SensorMap::is_output(e[i].type) && e[i].valid) { if (e[i].v1 == 1) s |= (1 << i); }
+    else if (d.outTarget[n] & (1 << i)) s |= (1 << i);
+  }
+  return s;
+}
+
+// ---------- helpers ----------
+static inline void ui_go(UiActions& act, UiPage p, int8_t dir) {
   act.requestPageChange = true;
-  act.nextPage = UiPage::Home;
+  act.nextPage = p;
+  act.dir = dir;
 }
 
-static inline void ui_handle_input(UiState& ui, DataModel& data, const EncoderEvents& ev, UiActions& act) {
-  int8_t d = ev.delta;
+static inline void ui_cancel_edits(UiState& ui) {
+  ui.relayEdit = false;
+  ui.settingsEdit = false;
+  ui.sensStage = 0;
+}
+
+static inline void ui_enter_node(UiState& ui, uint32_t now) {
+  ui.nodeItem = 0;
+  ui.nodeItemPrev = 0;
+  ui.itemAnim = false;
+  ui.cycleMs = now;
+  ui.cyclePauseUntil = 0;
+}
+
+static inline void ui_item_step(UiState& ui, uint8_t count, int8_t dir, uint32_t now) {
+  if (count < 2) return;
+  ui.nodeItemPrev = ui.nodeItem % count;
+  ui.nodeItem = (uint8_t)((ui.nodeItemPrev + (dir > 0 ? 1 : count - 1)) % count);
+  ui.itemDir = dir > 0 ? 1 : -1;
+  ui.itemAnim = true;
+  ui.itemAnimStartMs = now;
+  ui.cycleMs = now;
+}
+
+// Moves a list selection; returns true if the user scrolled above the first row.
+static inline bool ui_list_move(int8_t& idx, int8_t d, int8_t rows) {
+  if (d < 0 && idx == 0) return true;
+  idx = (int8_t)clamp_i32(idx + d, 0, rows - 1);
+  return false;
+}
+
+static inline uint16_t period_step(uint16_t v) { return v < 60 ? 1 : (v < 600 ? 10 : 60); }
+
+// ---------- input ----------
+static inline void ui_handle_input(UiState& ui, DataModel& data, const EncoderEvents& ev, UiActions& act, uint32_t now) {
+  const int8_t d = ev.delta;
 
   if (ev.longPress) {
-    ui_go_home(ui, act);
+    ui_cancel_edits(ui);
+    if (ui.page != UiPage::Home) ui_go(act, UiPage::Home, -1);
     return;
   }
 
   switch (ui.page) {
     case UiPage::Home: {
-      if (d) ui.homeIndex = (int8_t)clamp_u16(ui.homeIndex + d, 0, 4);
-
+      if (d) ui.homeIndex = (int8_t)clamp_i32(ui.homeIndex + d, 0, 4);
       if (ev.shortPress) {
-        UiPage to = UiPage::Home;
-        if (ui.homeIndex == 0) to = UiPage::NodeA_Details;
-        if (ui.homeIndex == 1) to = UiPage::NodeB_Details;
-        if (ui.homeIndex == 2) to = UiPage::Relay;
-        if (ui.homeIndex == 3) to = UiPage::Sensors;
-        if (ui.homeIndex == 4) to = UiPage::Settings1;
-        act.requestPageChange = true;
-        act.nextPage = to;
+        static const UiPage to[5] = { UiPage::NodeA_Details, UiPage::NodeB_Details, UiPage::Relay,
+                                      UiPage::Sensors, UiPage::Settings };
+        UiPage p = to[ui.homeIndex];
+        if (p == UiPage::NodeA_Details || p == UiPage::NodeB_Details) ui_enter_node(ui, now);
+        ui_go(act, p, 1);
       }
     } break;
 
-    case UiPage::NodeA_Details: {
-      if (d) {
-        act.requestPageChange = true;
-        act.nextPage = (d > 0) ? UiPage::NodeB_Details : UiPage::Home;
-      }
-    } break;
-
+    case UiPage::NodeA_Details:
     case UiPage::NodeB_Details: {
+      const uint8_t n = (ui.page == UiPage::NodeB_Details) ? 1 : 0;
       if (d) {
-        act.requestPageChange = true;
-        act.nextPage = (d > 0) ? UiPage::Relay : UiPage::NodeA_Details;
+        ui_item_step(ui, node_item_count(data, n), d, now);
+        ui.cyclePauseUntil = now + NODE_PAUSE_MS;
       }
+      if (ev.shortPress) ui_go(act, UiPage::Home, -1);
     } break;
 
     case UiPage::Relay: {
-      // 0 MANUAL TARGET
-      // 1 SEND
-      // 2 AUTO ENABLE
-      // 3 ON THRESH
-      // 4 OFF THRESH
-      // 5 COOLDOWN
+      OutRow outs[2 * Payload::EXT_SLOTS];
+      const uint8_t nOut = output_rows(data, outs, 2 * Payload::EXT_SLOTS);
+      const int8_t rows = (int8_t)(RELAY_FIXED_ROWS + nOut);
+      if (ui.relayIndex >= rows) ui.relayIndex = rows - 1;
+
       if (!ui.relayEdit) {
-        if (d) ui.relayIndex = (int8_t)clamp_u16(ui.relayIndex + d, 0, 5);
+        if (d && ui_list_move(ui.relayIndex, d, rows)) { ui_go(act, UiPage::Home, -1); break; }
 
         if (ev.shortPress) {
           if (ui.relayIndex == 0) {
-            data.relay_target_on = !data.relay_target_on;
-          } else if (ui.relayIndex == 1) {
-            act.sendRelayToggle = true;
+            bool cur = data.relayAck.pending ? data.relay_target_on : data.b.relay_state;
+            data.relay_target_on = !cur;
+            act.sendRelay = true;
             act.relayTargetOn = data.relay_target_on;
-          } else if (ui.relayIndex == 2) {
+          } else if (ui.relayIndex == 1) {
             data.autoPump.enabled = !data.autoPump.enabled;
             act.autoSave = true;
-          } else {
+          } else if (ui.relayIndex < RELAY_FIXED_ROWS) {
             ui.relayEdit = true;
+          } else {
+            const OutRow& o = outs[ui.relayIndex - RELAY_FIXED_ROWS];
+            uint8_t states = output_states(data, o.node) ^ (uint8_t)(1 << o.slot);
+            data.outTarget[o.node] = states;
+            act.sendOut = true;
+            act.outNode = o.node;
+            act.outStates = states;
           }
         }
       } else {
         if (d) {
-          if (ui.relayIndex == 3) data.autoPump.soil_on_threshold  = clamp_u16((int32_t)data.autoPump.soil_on_threshold  + d * 5, 0, 4095);
-          if (ui.relayIndex == 4) data.autoPump.soil_off_threshold = clamp_u16((int32_t)data.autoPump.soil_off_threshold + d * 5, 0, 4095);
-          if (ui.relayIndex == 5) data.autoPump.cooldown_sec       = clamp_u16((int32_t)data.autoPump.cooldown_sec       + d * 5, 0, 3600);
-          act.autoSave = true;
+          AutoPumpSettings& a = data.autoPump;
+          if (ui.relayIndex == 2) a.soil_on_threshold  = clamp_u16((int32_t)a.soil_on_threshold  + d * 10, 0, 4095);
+          if (ui.relayIndex == 3) a.soil_off_threshold = clamp_u16((int32_t)a.soil_off_threshold + d * 10, 0, 4095);
+          if (ui.relayIndex == 4) a.cooldown_sec       = clamp_u16((int32_t)a.cooldown_sec       + d * 5, 0, 3600);
         }
         if (ev.shortPress) {
           ui.relayEdit = false;
           act.autoSave = true;
         }
       }
-
-      if (d && !ui.relayEdit && (ui.relayIndex == 5) && d > 0) {
-        act.requestPageChange = true;
-        act.nextPage = UiPage::Settings1;
-      }
-      if (d && !ui.relayEdit && (ui.relayIndex == 0) && d < 0) {
-        act.requestPageChange = true;
-        act.nextPage = UiPage::NodeB_Details;
-      }
     } break;
 
-    case UiPage::Settings1: {
-      // 0 A PERIOD
-      // 1 A RXWIN
-      // 2 SEND A
-      if (!ui.settingsEdit1) {
-        if (d) ui.settingsIndex1 = (int8_t)clamp_u16(ui.settingsIndex1 + d, 0, 2);
-
+    case UiPage::Settings: {
+      if (!ui.settingsEdit) {
+        if (d && ui_list_move(ui.settingsIndex, d, SETTINGS_ROWS)) { ui_go(act, UiPage::Home, -1); break; }
         if (ev.shortPress) {
-          if (ui.settingsIndex1 == 2) {
-            act.sendCfgA = true;
-            act.cfgA_period_s = data.cfg.cfgA_period_s;
-            act.cfgA_rxwin_ms = data.cfg.cfgA_rxwin_ms;
-          } else {
-            ui.settingsEdit1 = true;
-          }
-        }
-
-        if (d > 0 && ui.settingsIndex1 == 2) {
-          act.requestPageChange = true;
-          act.nextPage = UiPage::Settings2;
-        }
-        if (d < 0 && ui.settingsIndex1 == 0) {
-          act.requestPageChange = true;
-          act.nextPage = UiPage::Relay;
+          if (ui.settingsIndex == 2) act.sendCfgA = true;
+          else if (ui.settingsIndex == 5) act.sendCfgB = true;
+          else ui.settingsEdit = true;
         }
       } else {
         if (d) {
-          if (ui.settingsIndex1 == 0) data.cfg.cfgA_period_s = clamp_u16((int32_t)data.cfg.cfgA_period_s + d, 1, 3600);
-          if (ui.settingsIndex1 == 1) data.cfg.cfgA_rxwin_ms = clamp_u16((int32_t)data.cfg.cfgA_rxwin_ms + d * 10, 50, 5000);
-        }
-        if (ev.shortPress) ui.settingsEdit1 = false;
-      }
-    } break;
-
-    case UiPage::Settings2: {
-      // 0 B PERIOD
-      // 1 B RXWIN
-      // 2 SEND B
-      if (!ui.settingsEdit2) {
-        if (d) ui.settingsIndex2 = (int8_t)clamp_u16(ui.settingsIndex2 + d, 0, 2);
-
-        if (ev.shortPress) {
-          if (ui.settingsIndex2 == 2) {
-            act.sendCfgB = true;
-            act.cfgB_period_s = data.cfg.cfgB_period_s;
-            act.cfgB_rxwin_ms = data.cfg.cfgB_rxwin_ms;
-          } else {
-            ui.settingsEdit2 = true;
+          ConfigState& c = data.cfg;
+          switch (ui.settingsIndex) {
+            case 0: c.cfgA_period_s = clamp_u16((int32_t)c.cfgA_period_s + d * period_step(c.cfgA_period_s), 5, 3600); break;
+            case 1: c.cfgA_rxwin_ms = clamp_u16((int32_t)c.cfgA_rxwin_ms + d * 50, 100, 5000); break;
+            case 3: c.cfgB_period_s = clamp_u16((int32_t)c.cfgB_period_s + d * period_step(c.cfgB_period_s), 5, 3600); break;
+            case 4: c.cfgB_rxwin_ms = clamp_u16((int32_t)c.cfgB_rxwin_ms + d * 50, 100, 8000); break;
           }
         }
-
-        if (d > 0 && ui.settingsIndex2 == 2) {
-          ui_go_home(ui, act);
-        }
-        if (d < 0 && ui.settingsIndex2 == 0) {
-          act.requestPageChange = true;
-          act.nextPage = UiPage::Settings1;
-        }
-      } else {
-        if (d) {
-          if (ui.settingsIndex2 == 0) data.cfg.cfgB_period_s = clamp_u16((int32_t)data.cfg.cfgB_period_s + d, 1, 3600);
-          if (ui.settingsIndex2 == 1) data.cfg.cfgB_rxwin_ms = clamp_u16((int32_t)data.cfg.cfgB_rxwin_ms + d * 10, 50, 5000);
-        }
-        if (ev.shortPress) ui.settingsEdit2 = false;
+        if (ev.shortPress) ui.settingsEdit = false;
       }
     } break;
 
     case UiPage::Sensors: {
-      // 0 NODE  1..3 built-in sensors  4..6 EXT1..3  7 SEND
       const uint8_t nodeId = ui.sensNode ? Payload::NODE_B : Payload::NODE_A;
       Payload::CmdSensorCfg& cfg = data.sensCfg[ui.sensNode];
-      const int8_t SENS_ROWS = 8;
 
       if (ui.sensStage == 0) {
-        if (d < 0 && ui.sensIndex == 0) { ui_go_home(ui, act); break; }
-        if (d) ui.sensIndex = (int8_t)clamp_u16(ui.sensIndex + d, 0, SENS_ROWS - 1);
+        if (d && ui_list_move(ui.sensIndex, d, SENS_ROWS)) { ui_go(act, UiPage::Home, -1); break; }
 
         if (ev.shortPress) {
           if (ui.sensIndex == 0) {
             ui.sensNode ^= 1;
-          } else if (ui.sensIndex == 1 && ui.sensNode == 1) {
-            ui.sensStage = 2;                       // Node B flow pin
-          } else if (ui.sensIndex >= 4 && ui.sensIndex <= 6) {
-            ui.sensStage = 1;                       // EXT slot: type first, then pin
           } else if (ui.sensIndex == SENS_ROWS - 1) {
             act.sendSens = true;
             act.sensNode = ui.sensNode;
+          } else {
+            ui.sensStage = 1;                         // type first, then pin
           }
-          // other rows are fixed wiring, nothing to edit
         }
       } else {
-        const bool isFlow = (ui.sensNode == 1 && ui.sensIndex == 1);
-        const uint8_t slot = isFlow ? SensorMap::FLOW_SLOT : (uint8_t)(ui.sensIndex - 4);
-
+        const uint8_t slot = (uint8_t)(ui.sensIndex - 1);
         if (d) {
-          int8_t dir = (d > 0) ? 1 : -1;
+          const int8_t dir = (d > 0) ? 1 : -1;
           if (ui.sensStage == 1) SensorMap::cycle_type(nodeId, cfg, slot, dir);
           else                   SensorMap::cycle_pin(nodeId, cfg, slot, dir);
         }
@@ -229,4 +234,31 @@ static inline void ui_handle_input(UiState& ui, DataModel& data, const EncoderEv
 
     default: break;
   }
+}
+
+// ---------- time based updates (call every loop) ----------
+// Returns true when the screen needs a redraw.
+static inline bool ui_tick(UiState& ui, const DataModel& data, uint32_t now) {
+  bool redraw = false;
+
+  if (ui.itemAnim && (uint32_t)(now - ui.itemAnimStartMs) >= ITEM_ANIM_MS) {
+    ui.itemAnim = false;
+    redraw = true;
+  }
+
+  const bool nodePage = (ui.page == UiPage::NodeA_Details || ui.page == UiPage::NodeB_Details);
+  if (nodePage && !ui.tr.active && !ui.itemAnim &&
+      (int32_t)(now - ui.cyclePauseUntil) >= 0 && (uint32_t)(now - ui.cycleMs) >= NODE_CYCLE_MS) {
+    const uint8_t n = (ui.page == UiPage::NodeB_Details) ? 1 : 0;
+    ui.cycleMs = now;
+    ui_item_step(ui, node_item_count(data, n), 1, now);
+    redraw = true;
+  }
+
+  // refresh "last seen" ages and live values once a second
+  if ((uint32_t)(now - ui.lastPeriodicMs) >= 1000) {
+    ui.lastPeriodicMs = now;
+    redraw = true;
+  }
+  return redraw;
 }

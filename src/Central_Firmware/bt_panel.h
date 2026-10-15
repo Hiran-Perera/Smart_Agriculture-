@@ -72,7 +72,7 @@ public:
     _bt.println("BT PANEL COMMANDS");
     _bt.println("  help");
     _bt.println("  status");
-    _bt.println("  page home|a|b|pump|setA|setB");
+    _bt.println("  page home|a|b|pump|sensors|settings");
     _bt.println("  relay on|off");
     _bt.println("  cfgA <period_s> <rxwin_ms>");
     _bt.println("  cfgB <period_s> <rxwin_ms>");
@@ -158,10 +158,11 @@ private:
     else if (arg == "a") _ui->page = UiPage::NodeA_Details;
     else if (arg == "b") _ui->page = UiPage::NodeB_Details;
     else if (arg == "pump") _ui->page = UiPage::Relay;
-    else if (arg == "setA") _ui->page = UiPage::Settings1;
-    else if (arg == "setB") _ui->page = UiPage::Settings2;
-    else { _bt.println("page: use home|a|b|pump|setA|setB"); return; }
+    else if (arg == "sensors") _ui->page = UiPage::Sensors;
+    else if (arg == "settings" || arg == "setA" || arg == "setB") _ui->page = UiPage::Settings;
+    else { _bt.println("page: use home|a|b|pump|sensors|settings"); return; }
 
+    _ui->tr.active = false;
     _ui->markDirty();
     _bt.print("page ok: "); _bt.println(arg);
   }
